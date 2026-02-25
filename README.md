@@ -2,7 +2,12 @@
 
 Convert Power BI reports (.pbip) into Databricks AI/BI dashboards (.lvdash.json) using AI-assisted coding with the [Databricks AI Dev Kit](https://github.com/databricks-solutions/ai-dev-kit/tree/main).
 
-This repository provides a structured workflow, conversion instructions, and a working example that AI coding assistants (Cursor, Claude Code, Windsurf, etc.) can follow to translate your Power BI dashboards into native Databricks AI/BI dashboards.
+This repository provides **two ways** to perform the conversion:
+
+| Method | Best For | How It Works |
+|--------|----------|-------------|
+| **Databricks App** | Self-service, non-technical users | Upload a zip, click a button, get a published dashboard |
+| **Local IDE** | Developers who want full control | AI coding assistant parses `.pbip` files and builds the dashboard interactively |
 
 ---
 
@@ -18,7 +23,102 @@ This repository provides a structured workflow, conversion instructions, and a w
 
 ---
 
-## How It Works
+## Method 1: Databricks App (Self-Service)
+
+The `app_for_conversions/` folder contains a ready-to-deploy Streamlit app that runs on Databricks Apps. It provides a simple web UI where users upload a zipped `.pbip` project, and the app uses an LLM to convert it into a published AI/BI dashboard -- no IDE or coding required.
+
+### Architecture
+
+```
+┌──────────────────────┐       ┌──────────────────────────┐       ┌──────────────────────┐
+│  User's Browser      │       │  Databricks App          │       │  Databricks Workspace│
+│                      │       │  (Streamlit on port 8080)│       │                      │
+│  Upload .pbip zip ───┼──────>│                          │       │                      │
+│  Enter report name   │       │  1. Extract zip          │       │                      │
+│  Click "Convert"     │       │  2. Parse PBI structure  │       │                      │
+│                      │       │  3. Send to LLM endpoint │──────>│  Model Serving       │
+│                      │       │  4. Parse JSON response  │       │  (Claude Opus 4.6)   │
+│  ← Open Dashboard ───┼──────<│  5. Create dashboard     │──────>│  Lakeview API        │
+│                      │       │  6. Publish dashboard    │──────>│  SQL Warehouse       │
+└──────────────────────┘       └──────────────────────────┘       └──────────────────────┘
+```
+
+### Prerequisites
+
+- A Databricks workspace with:
+  - A **SQL warehouse** (the warehouse ID is configured in `app.yaml`)
+  - A **Model Serving endpoint** for the LLM (default: `databricks-claude-opus-4-6`)
+  - **Databricks Apps** enabled
+
+### Deploy the App
+
+1. **Configure `app.yaml`**
+
+   Update the warehouse ID and LLM model to match your workspace:
+
+   ```yaml
+   command: ["streamlit", "run", "app.py"]
+
+   env:
+     - name: DATABRICKS_WAREHOUSE_ID
+       value: "<your-warehouse-id>"
+     - name: LLM_MODEL
+       value: "databricks-claude-opus-4-6"
+   ```
+
+   To find your warehouse ID, run:
+   ```bash
+   databricks warehouses list --output json | jq '.[].id'
+   ```
+
+2. **Upload and deploy**
+
+   ```bash
+   # Upload app files to your workspace
+   databricks workspace import-dir \
+     app_for_conversions \
+     /Workspace/Users/<your-email>/apps/pbi-converter \
+     --overwrite
+
+   # Create the app (first time only)
+   databricks apps create pbi-converter \
+     --description "Power BI to AI/BI Converter"
+
+   # Deploy
+   databricks apps deploy pbi-converter \
+     --source-code-path /Workspace/Users/<your-email>/apps/pbi-converter
+   ```
+
+3. **Open the app** at the URL shown in the deploy output (e.g., `https://pbi-converter-<workspace>.azure.databricksapps.com`).
+
+### Using the App
+
+1. **Export from Power BI Desktop**: File > Save As > Power BI project files (*.pbip)
+2. **Zip the results**: Select the `.pbip` file, `.Report/` folder, and `.SemanticModel/` folder, then compress them into a single `.zip` file
+3. **Upload**: Open the app, enter a dashboard name, upload the zip, and click **Convert & Publish**
+4. **View**: Click the **Open Dashboard** link to see your new AI/BI dashboard
+
+### App File Structure
+
+```
+app_for_conversions/
+├── app.py              # Streamlit app: UI + conversion logic
+├── app.yaml            # Databricks Apps config (command, env vars)
+├── requirements.txt    # Python dependencies (databricks-sdk, openai)
+├── knowledge/          # Reference docs loaded into the LLM system prompt
+│   ├── CONVERSION_GUIDE.md
+│   └── AIBI_DASHBOARD_SKILL.md
+└── static/
+    └── power_bi_save_as_pbip.png
+```
+
+---
+
+## Method 2: Local IDE (Developer Workflow)
+
+Use an AI coding assistant (Cursor, Claude Code, Windsurf) with the Databricks AI Dev Kit's MCP tools to convert dashboards interactively. This gives you full control over the output, the ability to test SQL queries before deploying, and iterative refinement.
+
+### Architecture
 
 ```
 ┌───────────────────────┐       ┌───────────────────────────┐       ┌──────────────────────────┐
@@ -34,24 +134,16 @@ This repository provides a structured workflow, conversion instructions, and a w
 └───────────────────────┘       └───────────────────────────┘       └──────────────────────────┘
 ```
 
----
-
-## Prerequisites
+### Prerequisites
 
 - **Power BI Desktop** (to export your report as `.pbip`)
 - **Databricks workspace** with a SQL warehouse and Unity Catalog tables
 - **AI coding assistant** with MCP support: [Cursor](https://cursor.com), [Claude Code](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview), or [Windsurf](https://windsurf.com)
 - **Python 3.11+** (for the AI Dev Kit MCP server)
 
----
+### Quick Start
 
-## Quick Start
-
-### 1. Install the Databricks AI Dev Kit
-
-The [AI Dev Kit](https://github.com/databricks-solutions/ai-dev-kit/tree/main) provides MCP tools that let your coding assistant execute SQL, manage dashboards, and interact with your Databricks workspace directly.
-
-Run the installer from the AI Dev Kit repository:
+#### 1. Install the Databricks AI Dev Kit
 
 ```bash
 # macOS / Linux
@@ -63,105 +155,73 @@ curl -fsSL https://raw.githubusercontent.com/databricks-solutions/ai-dev-kit/mai
 irm https://raw.githubusercontent.com/databricks-solutions/ai-dev-kit/main/install.ps1 | iex
 ```
 
-This will:
-- Clone the AI Dev Kit repository
-- Set up the Databricks MCP server
-- Install skills for Databricks development (dashboards, pipelines, SDK, etc.)
-- Configure your coding assistant (Cursor, Claude Code, or Windsurf)
+This sets up the Databricks MCP server and installs skills for dashboard development.
 
-After installation, verify you see a `.cursor/mcp.json` (or equivalent config for your assistant) that points to the Databricks MCP server.
-
-### 2. Set Up Your Conversion Project
-
-Replicate the structure of this repository for your own dashboards:
+#### 2. Set Up Your Conversion Project
 
 ```
 my-pbi-converter/
 ├── .cursor/
-│   ├── mcp.json                    # AI Dev Kit MCP server config (auto-created by installer)
-│   └── skills/                     # AI Dev Kit skills (auto-created by installer)
-├── figures/                        # Screenshots for documentation
+│   ├── mcp.json                    # AI Dev Kit MCP config (auto-created)
+│   └── skills/                     # AI Dev Kit skills (auto-created)
 ├── pbi-to-aibi-converter/
 │   ├── input/                      # Place your .pbip reports here
 │   │   └── YourReport.pbip
 │   │   └── YourReport.Report/
 │   │   └── YourReport.SemanticModel/
-│   ├── output/                     # Converted .lvdash.json files go here
-│   └── CONVERSION_GUIDE.md         # Conversion instructions for the AI assistant
-├── relevant_docs.md                # Reference links
+│   ├── output/                     # Converted .lvdash.json files
+│   └── CONVERSION_GUIDE.md         # Conversion rules for the AI assistant
 └── README.md
 ```
 
-Create the folders:
-
 ```bash
-mkdir -p pbi-to-aibi-converter/input
-mkdir -p pbi-to-aibi-converter/output
-mkdir -p figures
+mkdir -p pbi-to-aibi-converter/input pbi-to-aibi-converter/output
 ```
 
-Copy the `CONVERSION_GUIDE.md` from this repository into your `pbi-to-aibi-converter/` folder. This file contains the detailed mapping rules that the AI assistant will follow.
+Copy `CONVERSION_GUIDE.md` from this repository into your project.
 
-### 3. Export Your Power BI Report as .pbip
+#### 3. Export Your Power BI Report
 
-Open your report in Power BI Desktop and save it as a **Power BI Project file (.pbip)**:
+1. Open the report in Power BI Desktop
+2. Go to **File > Save As**
+3. Select **Power BI project files (\*.pbip)** from the "Save as type" dropdown
+4. Save to your `pbi-to-aibi-converter/input/` folder
 
-1. Go to **File > Save As**
-2. In the "Save as type" dropdown, select **Power BI project files (\*.pbip)**
-3. Save to your `pbi-to-aibi-converter/input/` folder
+> **Note:** The `.pbip` format is Power BI's source-control-friendly project format. Unlike `.pbix` (binary), `.pbip` files can be read and understood by AI coding assistants. See the [Power BI Projects documentation](https://learn.microsoft.com/en-us/power-bi/developer/projects/projects-overview) for details.
 
-![Save as .pbip in Power BI Desktop](figures/power_bi_save_as_pbip.png)
+#### 4. Ask Your AI Assistant to Convert
 
-This creates a folder structure with human-readable JSON and TMDL files that describe your report's visuals, data model, and relationships -- which is what the AI assistant will parse.
-
-> **Note:** The `.pbip` format is Power BI's source-control-friendly project format. Unlike `.pbix` (binary), `.pbip` files can be read and understood by AI coding assistants. See the [Power BI Projects documentation](https://learn.microsoft.com/en-us/power-bi/developer/projects/projects-overview) for more details.
-
-### 4. Ask Your AI Assistant to Convert It
-
-Open the project in your coding assistant and ask it to convert the dashboard. The assistant will use the AI Dev Kit's MCP tools to read the PBI structure, test SQL queries against your warehouse, and generate the AI/BI dashboard.
-
-**Example prompts:**
+Example prompts:
 
 > Convert the Power BI dashboard from `pbi-to-aibi-converter/input/` to a Databricks AI/BI dashboard. Follow the conversion instructions in `pbi-to-aibi-converter/CONVERSION_GUIDE.md`. Save the output as a `.lvdash.json` file in `pbi-to-aibi-converter/output/`.
 
-or more specifically:
+> Read the .pbip report in `pbi-to-aibi-converter/input/MyReport.Report/` and its semantic model in `pbi-to-aibi-converter/input/MyReport.SemanticModel/`. Map every visual to the equivalent AI/BI widget using CONVERSION_GUIDE.md. Test all SQL queries against my warehouse before creating the .lvdash.json.
 
-> Read the .pbip report in `pbi-to-aibi-converter/input/MyReport.Report/` and its semantic model in `pbi-to-aibi-converter/input/MyReport.SemanticModel/`. Map every visual, slicer, and card to the equivalent AI/BI widget type using the CONVERSION_GUIDE.md instructions. Test all SQL queries against my Databricks workspace before creating the .lvdash.json file.
-
-**What the assistant will do:**
-1. Parse the `.tmdl` table files to find source tables (`catalog.schema.table`)
+The assistant will:
+1. Parse `.tmdl` table files to find source tables (`catalog.schema.table`)
 2. Read `relationships.tmdl` to understand JOINs
 3. Read each `visual.json` to identify chart types, measures, and dimensions
-4. Design SQL datasets that flatten the PBI star schema into query-ready tables
-5. Test every query via the `execute_sql` MCP tool against your warehouse
+4. Design SQL datasets that flatten the PBI star schema
+5. Test every query via the `execute_sql` MCP tool
 6. Build the `.lvdash.json` following AI/BI dashboard spec rules
 7. Deploy and publish the dashboard to your workspace
 
-### 5. Publish the Dashboard
+#### 5. Publish the Dashboard
 
-After conversion, the AI assistant can deploy the dashboard directly using the MCP tools. If you prefer to publish manually, you have two options:
+**Option A: Let the assistant deploy (recommended)**
 
-**Option A: Let the assistant deploy it (recommended)**
+> Deploy the .lvdash.json file from `pbi-to-aibi-converter/output/` to my workspace and publish it.
 
-The assistant uses `create_or_update_dashboard` and `publish_dashboard` MCP tools to deploy directly to your workspace. Just ask:
-
-> Deploy the .lvdash.json file from `pbi-to-aibi-converter/output/` to my Databricks workspace and publish it.
-
-**Option B: Deploy via Databricks CLI**
+**Option B: Databricks CLI**
 
 ```bash
-# Import the dashboard JSON to your workspace
 databricks workspace import \
   pbi-to-aibi-converter/output/YourDashboard.lvdash.json \
   /Workspace/Users/your-email@company.com/YourDashboard.lvdash.json \
   --format AUTO --overwrite
-
-# Then open it in the Databricks UI and click "Publish"
 ```
 
-**Option C: Deploy via Databricks Asset Bundles (DABs)**
-
-For production deployments with CI/CD, add the dashboard to a DAB configuration:
+**Option C: Databricks Asset Bundles (CI/CD)**
 
 ```yaml
 # databricks.yml
@@ -180,8 +240,6 @@ databricks bundle deploy
 ---
 
 ## Included Example
-
-This repository includes a complete working example:
 
 | File | Description |
 |------|-------------|
@@ -242,24 +300,24 @@ The full guide is in [`pbi-to-aibi-converter/CONVERSION_GUIDE.md`](pbi-to-aibi-c
 
 ---
 
-## Relevant Documentation
-
-- [Power BI Projects (.pbip) Overview](https://learn.microsoft.com/en-us/power-bi/developer/projects/projects-overview) -- Understanding the `.pbip` file format
-- [How Hard Is It to Migrate a Power BI Dashboard?](https://blog.cauchy.io/p/how-hard-is-it-to-migrate-a-power?r=6r7jvu) -- Background on PBI migration challenges
-- [Databricks AI Dev Kit](https://github.com/databricks-solutions/ai-dev-kit/tree/main) -- MCP tools, skills, and builder app for AI-assisted Databricks development
-- [Databricks AI/BI Dashboards](https://docs.databricks.com/en/dashboards/index.html) -- Official documentation for the target dashboard format
-- [Databricks Asset Bundles](https://docs.databricks.com/en/dev-tools/bundles/index.html) -- CI/CD deployment for dashboards and other resources
-
----
-
 ## Tips for Complex Dashboards
 
-- **Multi-page reports**: Each PBI page becomes a separate `PAGE_TYPE_CANVAS` page in the AI/BI dashboard. Pages are listed in `pages/pages.json`.
+- **Multi-page reports**: Each PBI page becomes a separate `PAGE_TYPE_CANVAS` page. Pages are listed in `pages/pages.json`.
 - **DAX calculated columns**: Move the logic into the SQL dataset query using CASE/WHEN, COALESCE, or other Spark SQL functions.
 - **Cross-filtering**: AI/BI filters work through shared dataset columns. Include filter dimensions in every dataset that should respond to that filter.
 - **High cardinality dimensions**: If a PBI visual groups by a column with many distinct values (>10), use a table widget instead of a chart, or add a TOP-N filter in the SQL query.
 - **Maps / geo visuals**: AI/BI dashboards don't support map widgets. Convert these to tables or bar charts grouped by location.
-- **Custom visuals**: There is no equivalent for PBI custom visuals. Identify the closest standard widget type or represent the data differently.
+- **Custom visuals**: No equivalent for PBI custom visuals. Identify the closest standard widget type or represent the data differently.
+
+---
+
+## Relevant Documentation
+
+- [Power BI Projects (.pbip) Overview](https://learn.microsoft.com/en-us/power-bi/developer/projects/projects-overview)
+- [How Hard Is It to Migrate a Power BI Dashboard?](https://blog.cauchy.io/p/how-hard-is-it-to-migrate-a-power?r=6r7jvu)
+- [Databricks AI Dev Kit](https://github.com/databricks-solutions/ai-dev-kit/tree/main)
+- [Databricks AI/BI Dashboards](https://docs.databricks.com/en/dashboards/index.html)
+- [Databricks Asset Bundles](https://docs.databricks.com/en/dev-tools/bundles/index.html)
 
 ---
 
