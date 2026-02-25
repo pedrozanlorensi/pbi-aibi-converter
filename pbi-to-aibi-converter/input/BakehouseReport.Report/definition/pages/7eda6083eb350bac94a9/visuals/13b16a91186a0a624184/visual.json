@@ -1,0 +1,60 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.6.0/schema.json",
+  "name": "13b16a91186a0a624184",
+  "position": {
+    "x": 11.0054931932171,
+    "y": 261.68617148316218,
+    "z": 9002,
+    "height": 74.592787198471456,
+    "width": 317.93647002627182,
+    "tabOrder": 9002
+  },
+  "visual": {
+    "visualType": "slicer",
+    "query": {
+      "queryState": {
+        "Values": {
+          "projections": [
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "sales_franchises"
+                    }
+                  },
+                  "Property": "district"
+                }
+              },
+              "queryRef": "sales_franchises.district",
+              "nativeQueryRef": "District",
+              "active": true,
+              "displayName": "District"
+            }
+          ]
+        }
+      }
+    },
+    "objects": {
+      "data": [
+        {
+          "properties": {
+            "mode": {
+              "expr": {
+                "Literal": {
+                  "Value": "'Dropdown'"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "general": [
+        {
+          "properties": {}
+        }
+      ]
+    },
+    "drillFilterOtherVisuals": true
+  }
+}

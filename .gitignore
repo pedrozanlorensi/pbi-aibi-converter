@@ -1,0 +1,37 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+
+# AI Dev Kit (local install, not part of this repo)
+.ai-dev-kit/
+repo/
+
+# IDE and editor
+.cursor/mcp.json
+.vscode/
+.idea/
+
+# Databricks local state
+.databricks-resources.json
+.databricks/
+
+# macOS
+.DS_Store
+
+# Power BI local/cache files
+**/.pbi/cache.abf
+**/.pbi/localSettings.json
+**/.pbi/editorSettings.json

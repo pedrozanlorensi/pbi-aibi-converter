@@ -1,0 +1,58 @@
+table media_gold_reviews_chunked
+	lineageTag: 7d73bac4-b00a-4272-8ca5-55e24ccadac0
+
+	column franchiseID
+		dataType: int64
+		formatString: 0
+		lineageTag: fc6b4857-921a-48f6-8e7d-b0f9c19e1c21
+		summarizeBy: none
+		sourceColumn: franchiseID
+
+		annotation SummarizationSetBy = Automatic
+
+	column review_date
+		dataType: dateTime
+		formatString: General Date
+		lineageTag: 00172961-5ed0-415b-940d-04a6a25f6726
+		summarizeBy: none
+		sourceColumn: review_date
+
+		annotation SummarizationSetBy = Automatic
+
+	column chunked_text
+		dataType: string
+		lineageTag: 03a5d07e-e126-431c-8509-3ec287d7ca2c
+		summarizeBy: none
+		sourceColumn: chunked_text
+
+		annotation SummarizationSetBy = Automatic
+
+	column chunk_id
+		dataType: string
+		lineageTag: 4483cda9-f45d-4e13-a01f-f1828c36cafc
+		summarizeBy: none
+		sourceColumn: chunk_id
+
+		annotation SummarizationSetBy = Automatic
+
+	column review_uri
+		dataType: string
+		lineageTag: 0c71ebdb-fe1e-42a9-a509-08b247703092
+		summarizeBy: none
+		sourceColumn: review_uri
+
+		annotation SummarizationSetBy = Automatic
+
+	partition media_gold_reviews_chunked = m
+		mode: directQuery
+		source =
+				let
+				    Source = DatabricksMultiCloud.Catalogs("dbc-5ee5aa7f-f955.cloud.databricks.com", "/sql/1.0/warehouses/ab6da2a273158263", [Catalog = "", Database = ""]),
+				    samples_Database = Source{[Name="samples",Kind="Database"]}[Data],
+				    bakehouse_Schema = samples_Database{[Name="bakehouse",Kind="Schema"]}[Data],
+				    media_gold_reviews_chunked_Table = bakehouse_Schema{[Name="media_gold_reviews_chunked",Kind="Table"]}[Data]
+				in
+				    media_gold_reviews_chunked_Table
+
+	annotation PBI_ResultType = Table
+

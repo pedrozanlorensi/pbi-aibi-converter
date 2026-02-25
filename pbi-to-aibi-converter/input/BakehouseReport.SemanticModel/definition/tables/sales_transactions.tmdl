@@ -1,0 +1,107 @@
+table sales_transactions
+	lineageTag: 2a685eaa-2b7c-4e9d-a9ad-368feac1d6b8
+
+	measure TransactionMonth = [dateTime]
+		lineageTag: 62a8dfbe-b0db-4248-a456-e08b03844d13
+
+	column transactionID
+		dataType: int64
+		formatString: 0
+		lineageTag: 5036fb43-5c83-4cca-813d-f3a199301fb7
+		summarizeBy: count
+		sourceColumn: transactionID
+
+		annotation SummarizationSetBy = Automatic
+
+	column customerID
+		dataType: int64
+		formatString: 0
+		lineageTag: 746d7414-f50f-49e6-8795-0d6b500992af
+		summarizeBy: none
+		sourceColumn: customerID
+
+		annotation SummarizationSetBy = Automatic
+
+	column franchiseID
+		dataType: int64
+		formatString: 0
+		lineageTag: a063e950-58c1-4c76-9090-f2b07fceda73
+		summarizeBy: none
+		sourceColumn: franchiseID
+
+		annotation SummarizationSetBy = Automatic
+
+	column dateTime
+		dataType: dateTime
+		formatString: General Date
+		lineageTag: a6f69aea-33e2-4ea7-892f-7d88e9f7c6b1
+		summarizeBy: none
+		sourceColumn: dateTime
+
+		annotation SummarizationSetBy = Automatic
+
+	column product
+		dataType: string
+		lineageTag: 6e8776a0-7ec9-451b-a0f3-55c20ee7b766
+		summarizeBy: none
+		sourceColumn: product
+
+		annotation SummarizationSetBy = Automatic
+
+	column quantity
+		dataType: int64
+		formatString: 0
+		lineageTag: 8f7329ca-f63c-47dc-ab36-b244e01af018
+		summarizeBy: sum
+		sourceColumn: quantity
+
+		annotation SummarizationSetBy = Automatic
+
+	column unitPrice
+		dataType: int64
+		formatString: 0
+		lineageTag: 25b9fe4e-b764-4e53-9a3b-0ecfdb08d556
+		summarizeBy: sum
+		sourceColumn: unitPrice
+
+		annotation SummarizationSetBy = Automatic
+
+	column totalPrice
+		dataType: int64
+		formatString: 0
+		lineageTag: 4023bfcb-cc50-4301-bf8e-2e9511c4cc46
+		summarizeBy: sum
+		sourceColumn: totalPrice
+
+		annotation SummarizationSetBy = Automatic
+
+	column paymentMethod
+		dataType: string
+		lineageTag: 6af72d1f-51ed-4911-bc3b-d8de98ef103d
+		summarizeBy: none
+		sourceColumn: paymentMethod
+
+		annotation SummarizationSetBy = Automatic
+
+	column cardNumber
+		dataType: int64
+		formatString: 0
+		lineageTag: 61e52c4c-0cc5-4503-826b-f377d5d8b3e6
+		summarizeBy: sum
+		sourceColumn: cardNumber
+
+		annotation SummarizationSetBy = Automatic
+
+	partition sales_transactions = m
+		mode: directQuery
+		source =
+				let
+				    Source = DatabricksMultiCloud.Catalogs("dbc-5ee5aa7f-f955.cloud.databricks.com", "/sql/1.0/warehouses/ab6da2a273158263", [Catalog = "", Database = ""]),
+				    samples_Database = Source{[Name="samples",Kind="Database"]}[Data],
+				    bakehouse_Schema = samples_Database{[Name="bakehouse",Kind="Schema"]}[Data],
+				    sales_transactions_Table = bakehouse_Schema{[Name="sales_transactions",Kind="Table"]}[Data]
+				in
+				    sales_transactions_Table
+
+	annotation PBI_ResultType = Table
+

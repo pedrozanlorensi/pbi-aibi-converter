@@ -1,0 +1,102 @@
+table sales_franchises
+	lineageTag: f7711c88-7a4a-43c7-a0bd-da66a2833991
+
+	column franchiseID
+		dataType: int64
+		formatString: 0
+		lineageTag: 750a602f-c125-4395-8947-d2645b3140bb
+		summarizeBy: none
+		sourceColumn: franchiseID
+
+		annotation SummarizationSetBy = Automatic
+
+	column name
+		dataType: string
+		lineageTag: d30e0744-c550-4ba5-ba1f-19455bac3bd7
+		summarizeBy: none
+		sourceColumn: name
+
+		annotation SummarizationSetBy = Automatic
+
+	column city
+		dataType: string
+		lineageTag: 03aac33d-48ae-4f38-a5a6-3798ba81a844
+		summarizeBy: none
+		sourceColumn: city
+
+		annotation SummarizationSetBy = Automatic
+
+	column district
+		dataType: string
+		lineageTag: b7beac03-cbbb-48a8-a370-ace402e4522a
+		summarizeBy: none
+		sourceColumn: district
+
+		annotation SummarizationSetBy = Automatic
+
+	column zipcode
+		dataType: string
+		lineageTag: f01673fb-61f5-436f-9f02-5898e3ac1c8f
+		summarizeBy: none
+		sourceColumn: zipcode
+
+		annotation SummarizationSetBy = Automatic
+
+	column country
+		dataType: string
+		lineageTag: 74235889-6154-46b3-aa87-9ab2f3f69ce7
+		summarizeBy: none
+		sourceColumn: country
+
+		annotation SummarizationSetBy = Automatic
+
+	column size
+		dataType: string
+		lineageTag: 2d92380d-e478-4602-a4f0-d7d39995841d
+		summarizeBy: none
+		sourceColumn: size
+
+		annotation SummarizationSetBy = Automatic
+
+	column longitude
+		dataType: double
+		lineageTag: a72b2e56-a418-489f-b525-7beafe01d778
+		summarizeBy: sum
+		sourceColumn: longitude
+
+		annotation SummarizationSetBy = Automatic
+
+		annotation PBI_FormatHint = {"isGeneralNumber":true}
+
+	column latitude
+		dataType: double
+		lineageTag: dcc01149-efb4-420c-9edf-042bda3949c5
+		summarizeBy: sum
+		sourceColumn: latitude
+
+		annotation SummarizationSetBy = Automatic
+
+		annotation PBI_FormatHint = {"isGeneralNumber":true}
+
+	column supplierID
+		dataType: int64
+		formatString: 0
+		lineageTag: 431e25db-c76a-4ab2-9eb2-2fa04c217475
+		summarizeBy: none
+		sourceColumn: supplierID
+
+		annotation SummarizationSetBy = Automatic
+
+	partition sales_franchises = m
+		mode: directQuery
+		source =
+				let
+				    Source = DatabricksMultiCloud.Catalogs("dbc-5ee5aa7f-f955.cloud.databricks.com", "/sql/1.0/warehouses/ab6da2a273158263", [Catalog = "", Database = ""]),
+				    samples_Database = Source{[Name="samples",Kind="Database"]}[Data],
+				    bakehouse_Schema = samples_Database{[Name="bakehouse",Kind="Schema"]}[Data],
+				    sales_franchises_Table = bakehouse_Schema{[Name="sales_franchises",Kind="Table"]}[Data]
+				in
+				    sales_franchises_Table
+
+	annotation PBI_ResultType = Table
+

@@ -1,0 +1,85 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/report/definition/visualContainer/2.6.0/schema.json",
+  "name": "a37f0877aa42ad7d2240",
+  "position": {
+    "x": 1005.1683783138285,
+    "y": 96.603773584905667,
+    "z": 2000,
+    "height": 346.06161929782661,
+    "width": 275.13732983042752,
+    "tabOrder": 2000
+  },
+  "visual": {
+    "visualType": "pivotTable",
+    "query": {
+      "queryState": {
+        "Rows": {
+          "projections": [
+            {
+              "field": {
+                "Column": {
+                  "Expression": {
+                    "SourceRef": {
+                      "Entity": "sales_franchises"
+                    }
+                  },
+                  "Property": "name"
+                }
+              },
+              "queryRef": "sales_franchises.name",
+              "nativeQueryRef": "name",
+              "active": true
+            }
+          ]
+        },
+        "Values": {
+          "projections": [
+            {
+              "field": {
+                "Aggregation": {
+                  "Expression": {
+                    "Column": {
+                      "Expression": {
+                        "SourceRef": {
+                          "Entity": "sales_transactions"
+                        }
+                      },
+                      "Property": "transactionID"
+                    }
+                  },
+                  "Function": 5
+                }
+              },
+              "queryRef": "CountNonNull(sales_transactions.transactionID)",
+              "nativeQueryRef": "# Transactions",
+              "displayName": "# Transactions"
+            }
+          ]
+        }
+      },
+      "sortDefinition": {
+        "sort": [
+          {
+            "field": {
+              "Aggregation": {
+                "Expression": {
+                  "Column": {
+                    "Expression": {
+                      "SourceRef": {
+                        "Entity": "sales_transactions"
+                      }
+                    },
+                    "Property": "transactionID"
+                  }
+                },
+                "Function": 5
+              }
+            },
+            "direction": "Descending"
+          }
+        ]
+      }
+    },
+    "drillFilterOtherVisuals": true
+  }
+}

@@ -1,0 +1,22 @@
+relationship f73dcf86-e419-e325-1ca7-809a8d549b55
+	fromColumn: media_customer_reviews.franchiseID
+	toColumn: sales_franchises.franchiseID
+
+relationship 43bafd94-1c09-8424-6b33-e0918761fa7f
+	fromColumn: media_gold_reviews_chunked.franchiseID
+	toColumn: sales_franchises.franchiseID
+
+relationship 4ca9427a-dada-cb16-3715-5de0a4305638
+	fromColumn: sales_transactions.franchiseID
+	toColumn: sales_franchises.franchiseID
+
+relationship cac9d43c-c386-c697-38b5-0b6f2d310bac
+	fromColumn: sales_transactions.customerID
+	toColumn: sales_customers.customerID
+
+relationship c025d646-1a3a-de22-9e71-ff4d40103bb1
+	crossFilteringBehavior: bothDirections
+	fromCardinality: one
+	fromColumn: sales_franchises.supplierID
+	toColumn: sales_suppliers.supplierID
+

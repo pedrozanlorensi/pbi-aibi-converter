@@ -1,0 +1,23 @@
+model Model
+	culture: en-US
+	defaultPowerBIDataSourceVersion: powerBI_V3
+	sourceQueryCulture: pt-BR
+	dataAccessOptions
+		legacyRedirects
+		returnErrorValuesAsNull
+
+annotation __PBI_TimeIntelligenceEnabled = 1
+
+annotation PBI_QueryOrder = ["media_gold_reviews_chunked","media_customer_reviews","sales_customers","sales_franchises","sales_suppliers","sales_transactions"]
+
+annotation PBI_ProTooling = ["DevMode"]
+
+ref table media_gold_reviews_chunked
+ref table media_customer_reviews
+ref table sales_customers
+ref table sales_franchises
+ref table sales_suppliers
+ref table sales_transactions
+
+ref cultureInfo en-US
+

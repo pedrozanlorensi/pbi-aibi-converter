@@ -1,0 +1,114 @@
+table sales_customers
+	lineageTag: f88cb629-9450-48eb-9381-676b983ea101
+
+	column customerID
+		dataType: int64
+		formatString: 0
+		lineageTag: fe411e7a-3e6e-42e2-9701-07833cc066bb
+		summarizeBy: none
+		sourceColumn: customerID
+
+		annotation SummarizationSetBy = Automatic
+
+	column first_name
+		dataType: string
+		lineageTag: af518d4a-c739-42f9-8119-75f11d755601
+		summarizeBy: none
+		sourceColumn: first_name
+
+		annotation SummarizationSetBy = Automatic
+
+	column last_name
+		dataType: string
+		lineageTag: 27079167-75bb-4f50-b5c0-873ca8c5060e
+		summarizeBy: none
+		sourceColumn: last_name
+
+		annotation SummarizationSetBy = Automatic
+
+	column email_address
+		dataType: string
+		lineageTag: 88fafa5f-8b25-43ec-87d5-e88e1882ad6b
+		summarizeBy: none
+		sourceColumn: email_address
+
+		annotation SummarizationSetBy = Automatic
+
+	column phone_number
+		dataType: string
+		lineageTag: 1f1837ff-d3f1-4648-a95d-f22be15fefe1
+		summarizeBy: none
+		sourceColumn: phone_number
+
+		annotation SummarizationSetBy = Automatic
+
+	column address
+		dataType: string
+		lineageTag: 37c5085a-78b4-475b-bfe2-d718aad602c4
+		summarizeBy: none
+		sourceColumn: address
+
+		annotation SummarizationSetBy = Automatic
+
+	column city
+		dataType: string
+		lineageTag: 889094a5-8f68-49aa-b119-aa92d0def354
+		summarizeBy: none
+		sourceColumn: city
+
+		annotation SummarizationSetBy = Automatic
+
+	column state
+		dataType: string
+		lineageTag: e770d371-c849-4baf-95e5-12df8509c1c6
+		summarizeBy: none
+		sourceColumn: state
+
+		annotation SummarizationSetBy = Automatic
+
+	column country
+		dataType: string
+		lineageTag: cdc3ea79-87c2-451d-822f-45c0cc819b4a
+		summarizeBy: none
+		sourceColumn: country
+
+		annotation SummarizationSetBy = Automatic
+
+	column continent
+		dataType: string
+		lineageTag: 51bdca9a-fc90-4cd6-b5ef-d89bc76446ae
+		summarizeBy: none
+		sourceColumn: continent
+
+		annotation SummarizationSetBy = Automatic
+
+	column postal_zip_code
+		dataType: int64
+		formatString: 0
+		lineageTag: ce9b221d-2e6e-4c81-b414-82e63f84cbf9
+		summarizeBy: none
+		sourceColumn: postal_zip_code
+
+		annotation SummarizationSetBy = Automatic
+
+	column gender
+		dataType: string
+		lineageTag: 91739623-be4a-47d8-a2bc-b5f488dc0045
+		summarizeBy: none
+		sourceColumn: gender
+
+		annotation SummarizationSetBy = Automatic
+
+	partition sales_customers = m
+		mode: directQuery
+		source =
+				let
+				    Source = DatabricksMultiCloud.Catalogs("dbc-5ee5aa7f-f955.cloud.databricks.com", "/sql/1.0/warehouses/ab6da2a273158263", [Catalog = "", Database = ""]),
+				    samples_Database = Source{[Name="samples",Kind="Database"]}[Data],
+				    bakehouse_Schema = samples_Database{[Name="bakehouse",Kind="Schema"]}[Data],
+				    sales_customers_Table = bakehouse_Schema{[Name="sales_customers",Kind="Table"]}[Data]
+				in
+				    sales_customers_Table
+
+	annotation PBI_ResultType = Table
+

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "SemanticModel",
+    "displayName": "BakehouseReport"
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "70b558ea-a944-49d4-a9be-be98b00d3474"
+  }
+}

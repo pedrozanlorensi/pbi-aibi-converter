@@ -1,0 +1,51 @@
+table media_customer_reviews
+	lineageTag: d1a16ea7-2194-4079-8b48-8621ca9fae81
+
+	column review
+		dataType: string
+		lineageTag: 37159c1d-53bf-42e0-80e0-e4706cd389b8
+		summarizeBy: none
+		sourceColumn: review
+
+		annotation SummarizationSetBy = Automatic
+
+	column franchiseID
+		dataType: int64
+		formatString: 0
+		lineageTag: 922d2902-89ac-460b-ab23-7551248402b2
+		summarizeBy: none
+		sourceColumn: franchiseID
+
+		annotation SummarizationSetBy = Automatic
+
+	column review_date
+		dataType: dateTime
+		formatString: General Date
+		lineageTag: d48c6455-8359-4b4c-9265-ceb06bb1bec9
+		summarizeBy: none
+		sourceColumn: review_date
+
+		annotation SummarizationSetBy = Automatic
+
+	column new_id
+		dataType: int64
+		formatString: 0
+		lineageTag: 7e2cfb6d-4b33-4de6-a7be-9d06d710c67b
+		summarizeBy: sum
+		sourceColumn: new_id
+
+		annotation SummarizationSetBy = Automatic
+
+	partition media_customer_reviews = m
+		mode: directQuery
+		source =
+				let
+				    Source = DatabricksMultiCloud.Catalogs("dbc-5ee5aa7f-f955.cloud.databricks.com", "/sql/1.0/warehouses/ab6da2a273158263", [Catalog = "", Database = ""]),
+				    samples_Database = Source{[Name="samples",Kind="Database"]}[Data],
+				    bakehouse_Schema = samples_Database{[Name="bakehouse",Kind="Schema"]}[Data],
+				    media_customer_reviews_Table = bakehouse_Schema{[Name="media_customer_reviews",Kind="Table"]}[Data]
+				in
+				    media_customer_reviews_Table
+
+	annotation PBI_ResultType = Table
+

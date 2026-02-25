@@ -1,0 +1,314 @@
+{
+  "datasets": [
+    {
+      "name": "sales_overview",
+      "displayName": "Sales Overview",
+      "queryLines": [
+        "SELECT ",
+        "  t.transactionID, ",
+        "  t.customerID, ",
+        "  t.dateTime, ",
+        "  t.product, ",
+        "  t.quantity, ",
+        "  t.totalPrice, ",
+        "  f.name as franchise_name, ",
+        "  f.country, ",
+        "  f.city, ",
+        "  f.district ",
+        "FROM samples.bakehouse.sales_transactions t ",
+        "JOIN samples.bakehouse.sales_franchises f ON t.franchiseID = f.franchiseID"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "highlights",
+      "displayName": "Highlights",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "title",
+            "multilineTextboxSpec": {
+              "lines": ["## Bakehouse Sales Highlights"]
+            }
+          },
+          "position": {"x": 0, "y": 0, "width": 6, "height": 1}
+        },
+        {
+          "widget": {
+            "name": "subtitle",
+            "multilineTextboxSpec": {
+              "lines": ["Sales performance overview across bakehouse franchises"]
+            }
+          },
+          "position": {"x": 0, "y": 1, "width": 6, "height": 1}
+        },
+        {
+          "widget": {
+            "name": "total-customers",
+            "queries": [{
+              "name": "main_query",
+              "query": {
+                "datasetName": "sales_overview",
+                "fields": [{"name": "countdistinct(customerID)", "expression": "COUNT(DISTINCT `customerID`)"}],
+                "disaggregated": false
+              }
+            }],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {"fieldName": "countdistinct(customerID)", "displayName": "Customers"}
+              },
+              "frame": {"showTitle": true, "title": "Customers"}
+            }
+          },
+          "position": {"x": 0, "y": 2, "width": 2, "height": 3}
+        },
+        {
+          "widget": {
+            "name": "total-transactions",
+            "queries": [{
+              "name": "main_query",
+              "query": {
+                "datasetName": "sales_overview",
+                "fields": [{"name": "count(transactionID)", "expression": "COUNT(`transactionID`)"}],
+                "disaggregated": false
+              }
+            }],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {"fieldName": "count(transactionID)", "displayName": "Transactions"}
+              },
+              "frame": {"showTitle": true, "title": "Transactions"}
+            }
+          },
+          "position": {"x": 2, "y": 2, "width": 2, "height": 3}
+        },
+        {
+          "widget": {
+            "name": "total-revenue",
+            "queries": [{
+              "name": "main_query",
+              "query": {
+                "datasetName": "sales_overview",
+                "fields": [{"name": "sum(totalPrice)", "expression": "SUM(`totalPrice`)"}],
+                "disaggregated": false
+              }
+            }],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {"fieldName": "sum(totalPrice)", "displayName": "Total Revenue (USD)"}
+              },
+              "frame": {"showTitle": true, "title": "Total Revenue (USD)"}
+            }
+          },
+          "position": {"x": 4, "y": 2, "width": 2, "height": 3}
+        },
+        {
+          "widget": {
+            "name": "sales-by-product",
+            "queries": [{
+              "name": "main_query",
+              "query": {
+                "datasetName": "sales_overview",
+                "fields": [
+                  {"name": "product", "expression": "`product`"},
+                  {"name": "sum(quantity)", "expression": "SUM(`quantity`)"}
+                ],
+                "disaggregated": false
+              }
+            }],
+            "spec": {
+              "version": 3,
+              "widgetType": "pie",
+              "encodings": {
+                "color": {"fieldName": "product", "scale": {"type": "categorical"}, "displayName": "Product"},
+                "angle": {"fieldName": "sum(quantity)", "scale": {"type": "quantitative"}, "displayName": "Total Quantity"}
+              },
+              "frame": {"showTitle": true, "title": "Sales by Product"}
+            }
+          },
+          "position": {"x": 0, "y": 5, "width": 3, "height": 6}
+        },
+        {
+          "widget": {
+            "name": "franchise-transactions",
+            "queries": [{
+              "name": "main_query",
+              "query": {
+                "datasetName": "sales_overview",
+                "fields": [
+                  {"name": "franchise_name", "expression": "`franchise_name`"},
+                  {"name": "count(transactionID)", "expression": "COUNT(`transactionID`)"}
+                ],
+                "disaggregated": false
+              }
+            }],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {"fieldName": "count(transactionID)", "scale": {"type": "quantitative"}, "displayName": "# Transactions"},
+                "y": {"fieldName": "franchise_name", "scale": {"type": "categorical"}, "displayName": "Franchise"}
+              },
+              "frame": {"showTitle": true, "title": "Transactions by Franchise"}
+            }
+          },
+          "position": {"x": 3, "y": 5, "width": 3, "height": 6}
+        },
+        {
+          "widget": {
+            "name": "sales-trend-header",
+            "multilineTextboxSpec": {
+              "lines": ["### Sales Trend"]
+            }
+          },
+          "position": {"x": 0, "y": 11, "width": 6, "height": 1}
+        },
+        {
+          "widget": {
+            "name": "sales-over-time",
+            "queries": [{
+              "name": "main_query",
+              "query": {
+                "datasetName": "sales_overview",
+                "fields": [
+                  {"name": "daily(dateTime)", "expression": "DATE_TRUNC(\"DAY\", `dateTime`)"},
+                  {"name": "sum(totalPrice)", "expression": "SUM(`totalPrice`)"}
+                ],
+                "disaggregated": false
+              }
+            }],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {"fieldName": "daily(dateTime)", "scale": {"type": "temporal"}, "displayName": "Date"},
+                "y": {"fieldName": "sum(totalPrice)", "scale": {"type": "quantitative"}, "displayName": "Sales (USD)"}
+              },
+              "frame": {"showTitle": true, "title": "Sales Over Time"}
+            }
+          },
+          "position": {"x": 0, "y": 12, "width": 6, "height": 6}
+        }
+      ]
+    },
+    {
+      "name": "filters",
+      "displayName": "Filters",
+      "pageType": "PAGE_TYPE_GLOBAL_FILTERS",
+      "layout": [
+        {
+          "widget": {
+            "name": "filter-country",
+            "queries": [{
+              "name": "sales_overview_country",
+              "query": {
+                "datasetName": "sales_overview",
+                "fields": [{"name": "country", "expression": "`country`"}],
+                "disaggregated": false
+              }
+            }],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [{
+                  "fieldName": "country",
+                  "displayName": "Country",
+                  "queryName": "sales_overview_country"
+                }]
+              },
+              "frame": {"showTitle": true, "title": "Country"}
+            }
+          },
+          "position": {"x": 0, "y": 0, "width": 2, "height": 2}
+        },
+        {
+          "widget": {
+            "name": "filter-city",
+            "queries": [{
+              "name": "sales_overview_city",
+              "query": {
+                "datasetName": "sales_overview",
+                "fields": [{"name": "city", "expression": "`city`"}],
+                "disaggregated": false
+              }
+            }],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [{
+                  "fieldName": "city",
+                  "displayName": "City",
+                  "queryName": "sales_overview_city"
+                }]
+              },
+              "frame": {"showTitle": true, "title": "City"}
+            }
+          },
+          "position": {"x": 0, "y": 2, "width": 2, "height": 2}
+        },
+        {
+          "widget": {
+            "name": "filter-district",
+            "queries": [{
+              "name": "sales_overview_district",
+              "query": {
+                "datasetName": "sales_overview",
+                "fields": [{"name": "district", "expression": "`district`"}],
+                "disaggregated": false
+              }
+            }],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [{
+                  "fieldName": "district",
+                  "displayName": "District",
+                  "queryName": "sales_overview_district"
+                }]
+              },
+              "frame": {"showTitle": true, "title": "District"}
+            }
+          },
+          "position": {"x": 0, "y": 4, "width": 2, "height": 2}
+        },
+        {
+          "widget": {
+            "name": "filter-date",
+            "queries": [{
+              "name": "sales_overview_date",
+              "query": {
+                "datasetName": "sales_overview",
+                "fields": [{"name": "dateTime", "expression": "`dateTime`"}],
+                "disaggregated": false
+              }
+            }],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-date-range-picker",
+              "encodings": {
+                "fields": [{
+                  "fieldName": "dateTime",
+                  "displayName": "Transaction Date",
+                  "queryName": "sales_overview_date"
+                }]
+              },
+              "frame": {"showTitle": true, "title": "Transaction Date"}
+            }
+          },
+          "position": {"x": 0, "y": 6, "width": 2, "height": 2}
+        }
+      ]
+    }
+  ]
+}
