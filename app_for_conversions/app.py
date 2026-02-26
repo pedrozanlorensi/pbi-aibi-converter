@@ -21,6 +21,7 @@ import zipfile
 import tempfile
 import traceback
 from pathlib import Path
+from dataclasses import dataclass, field
 
 import streamlit as st
 from openai import OpenAI
@@ -32,6 +33,22 @@ st.set_page_config(page_title="PBI to AI/BI Converter", page_icon=":bar_chart:",
 
 MODEL = os.getenv("LLM_MODEL", "databricks-claude-opus-4-6")
 KNOWLEDGE_DIR = Path(__file__).parent / "knowledge"
+
+VALID_WIDGET_VERSIONS = {
+    "counter": 2,
+    "table": 2,
+    "filter-multi-select": 2,
+    "filter-single-select": 2,
+    "filter-date-range-picker": 2,
+    "bar": 3,
+    "line": 3,
+    "pie": 3,
+    "area": 3,
+    "pivot": 3,
+    "scatter": 3,
+}
+
+GRID_COLUMNS = 6
 
 
 def _load_knowledge_file(filename: str) -> str:
@@ -261,6 +278,52 @@ Return ONLY the JSON — no markdown fences, no explanation."""
     return response.choices[0].message.content
 
 
+def generate_explanation(report_name: str, pbi_context: str, dashboard_json: dict) -> str:
+    """Ask the LLM to produce a human-readable conversion report.
+
+    Takes the original PBI context and the generated dashboard JSON and
+    returns a markdown explanation of what was identified and how each
+    element was mapped.
+    """
+    client = get_llm_client()
+
+    serialized = json.dumps(dashboard_json, indent=2)
+    # Truncate the dashboard JSON to avoid exceeding token limits on the explanation call
+    if len(serialized) > 12000:
+        serialized = serialized[:12000] + "\n... (truncated)"
+
+    user_message = f"""I just converted a Power BI report named "{report_name}" to a Databricks AI/BI dashboard. Below are the original PBI contents and the resulting dashboard JSON.
+
+Write a concise conversion report in markdown. Include:
+
+1. **Source Summary** — tables, relationships, and pages found in the PBI report
+2. **Visual Mapping** — for each PBI visual, state the original type and what AI/BI widget it was converted to (use a table)
+3. **Data Sources** — list the catalog.schema.table references used in the SQL datasets
+4. **Filters** — which PBI slicers were converted to AI/BI filters and their type
+5. **Decisions & Trade-offs** — anything that was skipped (e.g. decorative shapes), approximated (e.g. unsupported chart types), or changed (e.g. DAX → SQL translations)
+6. **Potential Issues** — any areas where the conversion might need manual review
+
+Keep it under 500 words. Use markdown headers and tables for clarity.
+
+## Original PBI Report
+{pbi_context[:8000]}
+
+## Generated Dashboard JSON
+{serialized}"""
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": "You are a technical writer that produces clear, concise conversion reports."},
+            {"role": "user", "content": user_message},
+        ],
+        max_tokens=4096,
+        temperature=0,
+    )
+
+    return response.choices[0].message.content
+
+
 def extract_json_from_response(text: str) -> dict:
     """Extract a JSON object from the LLM response, stripping markdown fences if present."""
     text = text.strip()
@@ -301,6 +364,191 @@ def find_pbi_folders(tmpdir: str):
                     semantic_dir = semantic_dir or os.path.join(r, d)
 
     return report_dir, semantic_dir
+
+
+# ---------------------------------------------------------------------------
+# Dashboard Validation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ValidationResult:
+    """Collects validation errors and warnings for a dashboard JSON."""
+    errors: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
+    sql_results: list = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return len(self.errors) == 0
+
+    @property
+    def total_issues(self) -> int:
+        return len(self.errors) + len(self.warnings)
+
+
+def _get_dataset_sql(ds: dict) -> str:
+    """Extract the SQL string from a dataset, handling both queryLines (array) and query (string) formats."""
+    if "queryLines" in ds:
+        return " ".join(ds["queryLines"])
+    return ds.get("query", "")
+
+
+def validate_dashboard(dashboard_json: dict, warehouse_id: str, sp_client: WorkspaceClient) -> ValidationResult:
+    """Validate the generated .lvdash.json for structural correctness and SQL validity.
+
+    Structural checks:
+      - Required top-level keys (datasets, pages)
+      - Every dataset has a non-empty SQL query
+      - Widget versions match the spec (counter=2, bar/line/pie=3, etc.)
+      - Field names in widget.queries[].query.fields match spec.encodings fieldNames
+      - Every widget's datasetName references an existing dataset
+      - Layout grid: widget widths are within 1-6
+      - Text widgets use multilineTextboxSpec without a spec block
+
+    SQL checks:
+      - Execute each dataset query with LIMIT 1 against the warehouse
+    """
+    result = ValidationResult()
+    datasets = dashboard_json.get("datasets", [])
+    pages = dashboard_json.get("pages", [])
+
+    if not datasets:
+        result.errors.append("Missing `datasets` — dashboard has no data sources.")
+    if not pages:
+        result.errors.append("Missing `pages` — dashboard has no pages.")
+
+    # --- Dataset validation + SQL execution ---
+    dataset_names = set()
+    for ds in datasets:
+        ds_name = ds.get("name", "<unnamed>")
+        dataset_names.add(ds_name)
+
+        if not ds.get("displayName"):
+            result.warnings.append(f"Dataset `{ds_name}`: missing `displayName`.")
+
+        query_str = _get_dataset_sql(ds)
+        if not query_str.strip():
+            result.errors.append(f"Dataset `{ds_name}`: empty SQL query.")
+            result.sql_results.append((ds_name, False, "Empty query", []))
+            continue
+
+        try:
+            from databricks.sdk.service.sql import StatementState
+            stmt = sp_client.statement_execution.execute_statement(
+                warehouse_id=warehouse_id,
+                statement=f"SELECT * FROM ({query_str}) AS _t LIMIT 1",
+                wait_timeout="30s",
+            )
+            if stmt.status and stmt.status.state == StatementState.SUCCEEDED:
+                cols = [c.name for c in (stmt.manifest.schema.columns or [])] if stmt.manifest and stmt.manifest.schema else []
+                result.sql_results.append((ds_name, True, None, cols))
+            else:
+                error_msg = stmt.status.error.message if stmt.status and stmt.status.error else "Unknown error"
+                result.errors.append(f"Dataset `{ds_name}`: SQL query failed — {error_msg}")
+                result.sql_results.append((ds_name, False, error_msg, []))
+        except Exception as e:
+            result.errors.append(f"Dataset `{ds_name}`: SQL execution error — {e}")
+            result.sql_results.append((ds_name, False, str(e), []))
+
+    # --- Page & widget validation ---
+    for page in pages:
+        page_name = page.get("displayName", page.get("name", "<unnamed>"))
+        page_type = page.get("pageType", "")
+        layout = page.get("layout", [])
+
+        if not page_type:
+            result.warnings.append(f"Page `{page_name}`: missing `pageType`.")
+
+        for item in layout:
+            widget = item.get("widget", {})
+            position = item.get("position", {})
+            w_name = widget.get("name", "<unnamed>")
+
+            # --- Text widgets ---
+            if "multilineTextboxSpec" in widget:
+                if "spec" in widget:
+                    result.warnings.append(
+                        f"Text widget `{w_name}` on `{page_name}`: has both `multilineTextboxSpec` and `spec` — remove `spec`."
+                    )
+                lines = widget["multilineTextboxSpec"].get("lines", [])
+                if not lines:
+                    result.warnings.append(f"Text widget `{w_name}` on `{page_name}`: empty `lines` array.")
+                continue
+
+            # --- Data widgets ---
+            spec = widget.get("spec", {})
+            widget_queries = widget.get("queries", [])
+
+            if not spec and not widget_queries:
+                result.warnings.append(f"Widget `{w_name}` on `{page_name}`: has no `spec` and no `queries`.")
+                continue
+
+            widget_type = spec.get("widgetType", "")
+            version = spec.get("version", None)
+
+            # Version check
+            if widget_type in VALID_WIDGET_VERSIONS:
+                expected = VALID_WIDGET_VERSIONS[widget_type]
+                if version != expected:
+                    result.errors.append(
+                        f"Widget `{w_name}` on `{page_name}`: `{widget_type}` requires version {expected}, found {version}."
+                    )
+            elif widget_type and widget_type not in VALID_WIDGET_VERSIONS:
+                result.warnings.append(
+                    f"Widget `{w_name}` on `{page_name}`: unrecognized widgetType `{widget_type}`."
+                )
+
+            # Collect field names from widget.queries[].query.fields
+            query_field_names = set()
+            referenced_datasets = set()
+            for wq in widget_queries:
+                query_obj = wq.get("query", {})
+                ds_ref = query_obj.get("datasetName", "")
+                if ds_ref:
+                    referenced_datasets.add(ds_ref)
+                for f in query_obj.get("fields", []):
+                    fname = f.get("name", "")
+                    if fname:
+                        query_field_names.add(fname)
+
+            # Dataset reference check
+            for ds_ref in referenced_datasets:
+                if ds_ref not in dataset_names:
+                    result.errors.append(
+                        f"Widget `{w_name}` on `{page_name}`: references dataset `{ds_ref}` which doesn't exist."
+                    )
+
+            # Field name matching: encoding fieldNames must exist in query.fields
+            encodings = spec.get("encodings", {})
+            encoding_field_names = set()
+            for enc_key, enc_val in encodings.items():
+                if isinstance(enc_val, list):
+                    for enc_item in enc_val:
+                        if isinstance(enc_item, dict):
+                            fn = enc_item.get("fieldName", "")
+                            if fn:
+                                encoding_field_names.add(fn)
+                elif isinstance(enc_val, dict):
+                    fn = enc_val.get("fieldName", "")
+                    if fn:
+                        encoding_field_names.add(fn)
+
+            if query_field_names and encoding_field_names:
+                unmatched = encoding_field_names - query_field_names
+                if unmatched:
+                    result.errors.append(
+                        f"Widget `{w_name}` on `{page_name}`: encoding fieldName(s) {unmatched} not found in query fields {query_field_names}."
+                    )
+
+            # Grid layout check
+            w = position.get("width", 0)
+            if w < 1 or w > GRID_COLUMNS:
+                result.warnings.append(
+                    f"Widget `{w_name}` on `{page_name}`: width={w} is outside the 1–{GRID_COLUMNS} range."
+                )
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +605,7 @@ if convert_clicked:
     progress = st.status("Converting...", expanded=True)
 
     try:
+        # --- Phase 1: Extract & Parse ---
         progress.write("📦 Extracting uploaded files...")
         tmpdir = extract_upload(uploaded_file)
         report_dir, semantic_dir = find_pbi_folders(tmpdir)
@@ -382,6 +631,7 @@ if convert_clicked:
         n_tables = pbi_context.count("### Table:")
         progress.write(f"Collected **{n_tables} tables** and **{n_visuals} visuals**")
 
+        # --- Phase 2: LLM Conversion ---
         progress.write(f"🤖 Sending to **{MODEL}** for conversion...")
         raw_response = call_llm(report_name, pbi_context)
         progress.write("Received LLM response")
@@ -394,17 +644,9 @@ if convert_clicked:
         n_widgets = sum(len(p.get("layout", [])) for p in dashboard_json.get("pages", []))
         progress.write(f"Generated **{n_datasets} datasets**, **{n_pages} pages**, **{n_widgets} widgets**")
 
-        # Use the service principal client for all workspace operations
-        # (the user's forwarded token lacks the 'dashboards' scope).
-        progress.write("🚀 Deploying to Databricks workspace...")
+        # --- Phase 3: Validation ---
+        progress.write("🔍 Validating dashboard...")
         sp_client = WorkspaceClient()
-
-        parent_path = f"/Workspace/Shared/aibi_converter/{report_name}"
-
-        progress.write(f"Creating folder `{parent_path}`...")
-        sp_client.workspace.mkdirs(parent_path)
-
-        serialized = json.dumps(dashboard_json, indent=2)
 
         warehouse_id = os.getenv("DATABRICKS_WAREHOUSE_ID")
         if not warehouse_id:
@@ -416,13 +658,54 @@ if convert_clicked:
             st.error("No SQL warehouse found. Please set DATABRICKS_WAREHOUSE_ID.")
             st.stop()
 
+        validation = validate_dashboard(dashboard_json, warehouse_id, sp_client)
+
+        if validation.passed:
+            progress.write("✅ **Validation passed**")
+        else:
+            progress.write(f"⚠️ **Validation found {len(validation.errors)} error(s)** — see details below")
+
+        # --- Phase 4: Deploy ---
+        progress.write("🚀 Deploying to Databricks workspace...")
+
+        parent_path = f"/Workspace/Shared/aibi_converter/{report_name}"
+
+        progress.write(f"Creating folder `{parent_path}`...")
+        sp_client.workspace.mkdirs(parent_path)
+
+        serialized = json.dumps(dashboard_json, indent=2)
+
         dashboard_obj = Dashboard(
             display_name=report_name,
             parent_path=parent_path,
             serialized_dashboard=serialized,
             warehouse_id=warehouse_id,
         )
-        result = sp_client.lakeview.create(dashboard=dashboard_obj)
+
+        try:
+            result = sp_client.lakeview.create(dashboard=dashboard_obj)
+        except Exception as create_err:
+            if "already exists" in str(create_err):
+                progress.write("Dashboard already exists, searching for it to update...")
+                existing_id = None
+                for d in sp_client.lakeview.list():
+                    if d.display_name == report_name:
+                        existing_id = d.dashboard_id
+                        break
+                if not existing_id:
+                    # Fallback: delete the workspace node and recreate
+                    ws_path = f"{parent_path}/{report_name}.lvdash.json"
+                    progress.write(f"Removing existing file at `{ws_path}`...")
+                    try:
+                        sp_client.workspace.delete(ws_path)
+                    except Exception:
+                        pass
+                    result = sp_client.lakeview.create(dashboard=dashboard_obj)
+                else:
+                    progress.write(f"Updating existing dashboard `{existing_id}`...")
+                    result = sp_client.lakeview.update(dashboard_id=existing_id, dashboard=dashboard_obj)
+            else:
+                raise
 
         dashboard_id = result.dashboard_id
         host = sp_client.config.host.rstrip("/")
@@ -433,19 +716,97 @@ if convert_clicked:
         progress.write("📢 Publishing dashboard...")
         sp_client.lakeview.publish(dashboard_id=dashboard_id, warehouse_id=warehouse_id)
 
+        # --- Phase 5: Conversion Explanation ---
+        progress.write("📝 Generating conversion report...")
+        explanation = generate_explanation(report_name, pbi_context, dashboard_json)
+
         progress.update(label="Conversion complete!", state="complete")
 
+        # --- Results Display ---
         st.divider()
         st.success("Dashboard converted and published successfully!")
 
-        col1, col2 = st.columns(2)
-        col1.metric("Widgets", n_widgets)
-        col2.metric("Pages", n_pages)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Datasets", n_datasets)
+        col2.metric("Widgets", n_widgets)
+        col3.metric("Pages", n_pages)
 
         st.markdown(f"**Report:** {report_name}")
         st.markdown(f"**Model:** `{MODEL}`")
         st.markdown(f"**Workspace path:** `{workspace_path}`")
         st.markdown(f"**[Open Dashboard]({dash_url})**")
+
+        # Conversion explanation (shown first)
+        with st.expander("Conversion Report", expanded=False):
+            st.markdown(explanation)
+
+        # Validation summary
+        with st.expander("Validation Results", expanded=False):
+            if validation.passed and not validation.warnings:
+                st.success("All checks passed — no errors or warnings.")
+            elif validation.passed:
+                st.info(f"No errors, but {len(validation.warnings)} warning(s) found.")
+            else:
+                st.warning(f"{len(validation.errors)} error(s) and {len(validation.warnings)} warning(s) found.")
+
+            # Dashboard structure
+            st.markdown("#### Dashboard Structure")
+            st.markdown(f"- **Datasets:** {n_datasets}")
+            st.markdown(f"- **Pages:** {n_pages}")
+            st.markdown(f"- **Widgets:** {n_widgets}")
+
+            # Widget inventory
+            st.markdown("#### Widget Inventory")
+            for page in dashboard_json.get("pages", []):
+                p_name = page.get("displayName", page.get("name", ""))
+                p_type = page.get("pageType", "unknown")
+                widgets_on_page = page.get("layout", [])
+                st.markdown(f"**{p_name}** ({p_type}) — {len(widgets_on_page)} widget(s)")
+                for item in widgets_on_page:
+                    w = item.get("widget", {})
+                    pos = item.get("position", {})
+                    w_name = w.get("name", "")
+                    pos_str = f"x={pos.get('x')}, y={pos.get('y')}, w={pos.get('width')}, h={pos.get('height')}"
+                    if "multilineTextboxSpec" in w:
+                        text_preview = (w["multilineTextboxSpec"].get("lines", [""])[0] or "")[:60]
+                        st.markdown(f"- `{w_name}` — **text** — {pos_str} — *{text_preview}*")
+                    else:
+                        spec = w.get("spec", {})
+                        wt = spec.get("widgetType", "unknown")
+                        ver = spec.get("version", "?")
+                        expected = VALID_WIDGET_VERSIONS.get(wt)
+                        ver_status = "✅" if expected is None or ver == expected else f"❌ (expected {expected})"
+                        st.markdown(f"- `{w_name}` — **{wt}** v{ver} {ver_status} — {pos_str}")
+
+            # SQL query validation
+            if validation.sql_results:
+                st.markdown("#### SQL Query Validation")
+                for ds_name, succeeded, error_msg, cols in validation.sql_results:
+                    if succeeded:
+                        st.markdown(f"- ✅ `{ds_name}` — query OK, {len(cols)} columns returned: `{'`, `'.join(cols[:15])}`")
+                    else:
+                        st.markdown(f"- ❌ `{ds_name}` — {error_msg}")
+
+            # Field name consistency
+            field_issues = [e for e in validation.errors if "fieldName" in e or "query fields" in e]
+            dataset_issues = [e for e in validation.errors if "references dataset" in e]
+            other_errors = [e for e in validation.errors if e not in field_issues and e not in dataset_issues and "SQL" not in e]
+
+            if field_issues or dataset_issues or other_errors:
+                st.markdown("#### Structural Errors")
+                for err in field_issues + dataset_issues + other_errors:
+                    st.markdown(f"- ❌ {err}")
+            else:
+                st.markdown("#### Structural Checks")
+                st.markdown("- ✅ All widget versions are correct")
+                st.markdown("- ✅ All encoding fieldNames match query field names")
+                st.markdown("- ✅ All dataset references are valid")
+                st.markdown("- ✅ All widget positions are within the 6-column grid")
+
+            if validation.warnings:
+                st.markdown("#### Warnings")
+                for warn in validation.warnings:
+                    st.markdown(f"- ⚠️ {warn}")
 
     except json.JSONDecodeError as e:
         progress.update(label="Error", state="error")

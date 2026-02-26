@@ -71,7 +71,18 @@ The `app_for_conversions/` folder contains a ready-to-deploy Streamlit app that 
    databricks warehouses list --output json | jq '.[].id'
    ```
 
-2. **Upload and deploy**
+2. **Grant the app's service principal access to the SQL warehouse**
+
+   When you create a Databricks App, a service principal is automatically provisioned for it. This service principal needs **CAN USE** permission on the SQL warehouse configured in `app.yaml`, because the app uses the service principal's credentials (not the user's token) to create dashboards, publish them, validate SQL queries, and create workspace folders.
+
+   To grant access:
+   1. Go to **SQL Warehouses** in the Databricks UI
+   2. Click on your warehouse > **Permissions**
+   3. Add the app's service principal (named after your app, e.g., `pbi-converter`) with **Can use** permission
+
+   Without this, the app will fail with permission errors when trying to deploy or validate dashboards.
+
+3. **Upload and deploy**
 
    ```bash
    # Upload app files to your workspace
