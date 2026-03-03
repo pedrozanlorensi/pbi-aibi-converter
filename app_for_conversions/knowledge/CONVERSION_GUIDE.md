@@ -87,7 +87,7 @@ From this, extract:
 | `lineChart` | `line` | 3 | Map Category to x, Y to y encoding |
 | `barChart` / `clusteredBarChart` | `bar` | 3 | Map Category to x/y, Values to y/x |
 | `donutChart` / `pieChart` | `pie` | 3 | Map Category to color, Y to angle |
-| `pivotTable` / `table` | `table` or `bar` | 2 or 3 | Tables for detail; bar charts for ranked data |
+| `pivotTable` / `table` | `table` | 2 | Preserve the tabular layout — always use a table widget, never a bar chart |
 | `shape` | (skip) | - | Decorative elements have no equivalent |
 | `map` / `filledMap` | (no equivalent) | - | Use a table with location data instead |
 
@@ -170,7 +170,7 @@ PBI `textbox` visual with paragraph text becomes a text widget:
 ```
 - No `spec` block for text widgets
 - Use markdown: `##` for h2, `###` for h3, `**bold**`
-- Use separate widgets for title and subtitle (lines[] concatenates, doesn't add newlines)
+- **ONLY** create text widgets when the PBI report has an explicit `textbox` visual. NEVER invent or add text widgets (titles, subtitles, section headers) that don't exist in the source report.
 
 #### Card -> Counter
 PBI `card` with `CountNonNull(sales_transactions.customerID)` becomes:
@@ -304,14 +304,13 @@ PBI uses pixel coordinates on a 1280x720 canvas. AI/BI uses a 6-column grid.
 - `grid_x = round(pbi_x / 1280 * 6)`
 - `grid_width = round(pbi_width / 1280 * 6)` (minimum 1, snap to fill row = 6)
 
-**Height mapping:**
-- KPI cards: height 3-4 (never 2)
-- Charts: height 5-6
-- Tables: height 5-8
-- Text headers: height 1
-- Filters: height 2
+**Height mapping:** Derived proportionally from PBI pixel heights (12 grid rows per 720px canvas). Universal minimum of 2 (1 for text headers). No per-type maximums — the PBI designer's sizing choices are preserved.
 
-**Row rule:** Every row must sum to exactly width=6 with no gaps.
+**Width mapping:** Columns are distributed proportionally among visuals in each row based on their PBI pixel widths. This naturally gives wider PBI visuals more columns without hardcoded minimums.
+
+**Column-skyline packing:** Each widget's y is determined by the tallest occupied cell in the columns it spans — NOT by the tallest widget in the whole row. Short widgets (filters, cards) stack tightly in their columns while taller widgets (charts, tables) span independently. This eliminates blank space below short items.
+
+**Position enforcement:** After the LLM generates the dashboard, widget positions are programmatically overridden to match the blueprint. Phantom/duplicate widgets are removed.
 
 ### Step 9: Handle Filters
 
@@ -319,10 +318,12 @@ PBI slicers are placed directly on the page canvas. In AI/BI, you choose between
 
 | Filter Scope | Where to Place | Effect |
 |-------------|----------------|--------|
-| **Global** | Dedicated page with `PAGE_TYPE_GLOBAL_FILTERS` | Filters ALL pages |
 | **Page-level** | On the same `PAGE_TYPE_CANVAS` page | Filters ONLY that page |
+| **Global** | Dedicated page with `PAGE_TYPE_GLOBAL_FILTERS` | Filters ALL pages |
 
-Most PBI slicers that appear on a single-page report should become **global filters** since they filter the entire dashboard.
+**Default behavior:** Convert PBI slicers to **page-level filter widgets** placed directly on their respective canvas page. This preserves the original PBI layout where slicers live alongside the visuals they filter.
+
+**When to use global filters:** Only create a `PAGE_TYPE_GLOBAL_FILTERS` page when there are truly global slicers — i.e., in a multi-page report where the same slicer field appears on every page. In a single-page report, all slicers are always page-level.
 
 ### Step 10: Test and Deploy
 
@@ -401,5 +402,5 @@ The included `BakehouseSalesHighlights.lvdash.json` was converted from the PBI r
 | District slicer | slicer | `filter-district` | filter-multi-select v2 |
 | Date slicer | slicer | `filter-date` | filter-date-range-picker v2 |
 | Product donut | donutChart | `sales-by-product` | pie v3 |
-| Franchise pivot table | pivotTable | `franchise-transactions` | bar v3 |
+| Franchise pivot table | pivotTable | `franchise-transactions` | table v2 |
 | Sales line chart | lineChart | `sales-over-time` | line v3 |

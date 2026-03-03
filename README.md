@@ -25,6 +25,11 @@ This repository provides **two ways** to perform the conversion:
 
 ## Method 1: Databricks App (Self-Service)
 
+**Databricks App UI**
+
+![Converter App UI](figures/converter_app.png)
+
+
 The `app_for_conversions/` folder contains a ready-to-deploy Streamlit app that runs on Databricks Apps. It provides a simple web UI where users upload a zipped `.pbip` project, and the app uses an LLM to convert it into a published AI/BI dashboard -- no IDE or coding required.
 
 ### Architecture
