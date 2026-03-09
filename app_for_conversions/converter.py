@@ -131,36 +131,231 @@ def find_pbi_folders(tmpdir: str):
     return report_dir, semantic_dir
 
 
+def extract_pbi_source_tables(semantic_model_dir: str) -> list[dict]:
+    """Parse .tmdl files and extract fully-qualified source table references.
+
+    Each .tmdl partition block contains M-expression code like:
+        Source{[Name="samples",Kind="Database"]}[Data],
+        bakehouse_Schema = ...{[Name="bakehouse",Kind="Schema"]}[Data],
+        sales_transactions_Table = ...{[Name="sales_transactions",Kind="Table"]}[Data]
+
+    Returns a list of dicts: [{"pbi_table": "sales_transactions",
+                               "source_fqn": "samples.bakehouse.sales_transactions"}, ...]
+    """
+    import re
+
+    tables_dir = os.path.join(semantic_model_dir, "definition", "tables")
+    results = []
+
+    if not os.path.isdir(tables_dir):
+        return results
+
+    for tmdl_file in sorted(glob.glob(os.path.join(tables_dir, "*.tmdl"))):
+        with open(tmdl_file, "r") as f:
+            content = f.read()
+
+        pbi_table_match = re.match(r"^table\s+(\S+)", content)
+        pbi_table = pbi_table_match.group(1) if pbi_table_match else os.path.splitext(os.path.basename(tmdl_file))[0]
+
+        catalog = schema = table = None
+        for line in content.splitlines():
+            db_match = re.search(r'\[Name="([^"]+)",\s*Kind="Database"\]', line)
+            if db_match:
+                catalog = db_match.group(1)
+            sc_match = re.search(r'\[Name="([^"]+)",\s*Kind="Schema"\]', line)
+            if sc_match:
+                schema = sc_match.group(1)
+            tb_match = re.search(r'\[Name="([^"]+)",\s*Kind="Table"\]', line)
+            if tb_match:
+                table = tb_match.group(1)
+
+        if catalog and schema and table:
+            fqn = f"{catalog}.{schema}.{table}"
+        elif table:
+            fqn = table
+        else:
+            fqn = pbi_table
+
+        results.append({"pbi_table": pbi_table, "source_fqn": fqn})
+
+    return results
+
+
+# M-expression connector patterns → (source_type, is_databricks)
+_CONNECTOR_PATTERNS: list[tuple[str, str, bool]] = [
+    ("DatabricksMultiCloud", "Databricks", True),
+    ("Databricks.Catalogs", "Databricks", True),
+    ("Sql.Database", "SQL Server", False),
+    ("Sql.Databases", "SQL Server", False),
+    ("AzureSynapseAnalytics", "Azure Synapse Analytics", False),
+    ("Oracle.Database", "Oracle", False),
+    ("Snowflake.Databases", "Snowflake", False),
+    ("PostgreSQL.Database", "PostgreSQL", False),
+    ("MySQL.Database", "MySQL", False),
+    ("GoogleBigQuery", "Google BigQuery", False),
+    ("AmazonRedshift", "Amazon Redshift", False),
+    ("Teradata.Database", "Teradata", False),
+    ("SapHana.Database", "SAP HANA", False),
+    ("Odbc.DataSource", "ODBC", False),
+    ("OleDb.DataSource", "OLE DB", False),
+    ("Csv.Document", "CSV File", False),
+    ("Excel.Workbook", "Excel", False),
+    ("SharePoint", "SharePoint", False),
+    ("Web.Contents", "Web API", False),
+    ("AzureStorage", "Azure Blob Storage", False),
+    ("AzureDataLakeStorage", "Azure Data Lake Storage", False),
+]
+
+
+
+def detect_external_sources(semantic_model_dir: str) -> list[dict]:
+    """Scan .tmdl partition blocks and classify each table's data source connector.
+
+    Returns a list of dicts:
+        [{"pbi_table": "...", "source_type": "SQL Server", "is_databricks": False,
+          "recommendation": "...", "connector_detail": "server.database.windows.net"}, ...]
+    """
+    import re
+
+    tables_dir = os.path.join(semantic_model_dir, "definition", "tables")
+    results = []
+
+    if not os.path.isdir(tables_dir):
+        return results
+
+    for tmdl_file in sorted(glob.glob(os.path.join(tables_dir, "*.tmdl"))):
+        with open(tmdl_file, "r") as f:
+            content = f.read()
+
+        pbi_table_match = re.match(r"^table\s+(\S+)", content)
+        pbi_table = pbi_table_match.group(1) if pbi_table_match else os.path.splitext(os.path.basename(tmdl_file))[0]
+
+        partition_block = ""
+        in_partition = False
+        for line in content.splitlines():
+            if line.strip().startswith("partition "):
+                in_partition = True
+            if in_partition:
+                partition_block += line + "\n"
+
+        source_type = "Unknown"
+        is_databricks = False
+        connector_detail = ""
+
+        for pattern, stype, is_dbx in _CONNECTOR_PATTERNS:
+            if pattern in partition_block:
+                source_type = stype
+                is_databricks = is_dbx
+                detail_match = re.search(rf'{pattern}[^"]*"([^"]*)"', partition_block)
+                if detail_match:
+                    connector_detail = detail_match.group(1)
+                break
+
+        results.append({
+            "pbi_table": pbi_table,
+            "source_type": source_type,
+            "is_databricks": is_databricks,
+            "connector_detail": connector_detail,
+        })
+
+    return results
+
+
+def _slim_tmdl(content: str) -> str:
+    """Strip non-essential metadata from a .tmdl file.
+
+    Keeps table/column names, data types, measures, DAX expressions, and
+    partition source blocks.  Drops lineageTags, annotations, formatStrings,
+    and summarizeBy — none of these affect the SQL conversion.
+    """
+    skip_prefixes = ("lineageTag:", "annotation ", "formatString:", "summarizeBy:")
+    lines = []
+    prev_blank = False
+    for line in content.splitlines():
+        stripped = line.strip()
+        if any(stripped.startswith(p) for p in skip_prefixes):
+            continue
+        if stripped == "":
+            if prev_blank:
+                continue
+            prev_blank = True
+        else:
+            prev_blank = False
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _slim_visual_data(vis_data: dict) -> dict:
+    """Keep only the fields the LLM needs from a visual.json structure.
+
+    Retains: visual type, position, data bindings (prototypeQuery,
+    dataTransforms, columnProperties), and title.
+    Drops: objects, visualContainerObjects, drillFilterOtherVisuals,
+    and all formatting/style/conditional-formatting sections.
+    """
+    slim: dict = {}
+    if "name" in vis_data:
+        slim["name"] = vis_data["name"]
+    if "position" in vis_data:
+        slim["position"] = vis_data["position"]
+
+    visual = vis_data.get("visual", {})
+    slim_vis: dict = {}
+    keep_keys = (
+        "visualType", "prototypeQuery", "dataTransforms",
+        "columnProperties", "title", "singleVisual",
+    )
+    for key in keep_keys:
+        if key in visual:
+            val = visual[key]
+            if key == "singleVisual" and isinstance(val, dict):
+                sv = {}
+                for sk in ("prototypeQuery", "projections", "sort"):
+                    if sk in val:
+                        sv[sk] = val[sk]
+                if sv:
+                    slim_vis[key] = sv
+            else:
+                slim_vis[key] = val
+
+    if not slim_vis:
+        slim_vis["visualType"] = visual.get("visualType", "unknown")
+
+    slim["visual"] = slim_vis
+    return slim
+
+
 def collect_pbi_context(report_dir: str, semantic_model_dir: str) -> str:
     """Collect all PBI artifacts into a single text block for the LLM.
 
     Reads .tmdl table definitions, relationships, model metadata, page configs,
-    and visual.json files — everything the LLM needs to understand the report.
+    and visual.json files.  Non-essential metadata (lineageTags, annotations,
+    formatting objects) is stripped to keep the context within LLM token limits.
     """
     sections = []
 
-    # Semantic model: table definitions (.tmdl)
+    # Semantic model: table definitions (.tmdl) — slimmed
     tables_dir = os.path.join(semantic_model_dir, "definition", "tables")
     if os.path.isdir(tables_dir):
         for tmdl_file in sorted(glob.glob(os.path.join(tables_dir, "*.tmdl"))):
             name = os.path.basename(tmdl_file)
             with open(tmdl_file, "r") as f:
                 content = f.read()
-            sections.append(f"### Table: {name}\n```\n{content}\n```")
+            sections.append(f"### Table: {name}\n```\n{_slim_tmdl(content)}\n```")
 
-    # Semantic model: relationships between tables
+    # Semantic model: relationships between tables — slimmed
     rel_file = os.path.join(semantic_model_dir, "definition", "relationships.tmdl")
     if os.path.isfile(rel_file):
         with open(rel_file, "r") as f:
             content = f.read()
-        sections.append(f"### Relationships\n```\n{content}\n```")
+        sections.append(f"### Relationships\n```\n{_slim_tmdl(content)}\n```")
 
-    # Semantic model: top-level model metadata
+    # Semantic model: top-level model metadata — slimmed
     model_file = os.path.join(semantic_model_dir, "definition", "model.tmdl")
     if os.path.isfile(model_file):
         with open(model_file, "r") as f:
             content = f.read()
-        sections.append(f"### Model\n```\n{content}\n```")
+        sections.append(f"### Model\n```\n{_slim_tmdl(content)}\n```")
 
     # Report: pages and visuals
     pages_dir = os.path.join(report_dir, "definition", "pages")
@@ -181,8 +376,9 @@ def collect_pbi_context(report_dir: str, semantic_model_dir: str) -> str:
             for vis_path in sorted(glob.glob(os.path.join(page_dir, "visuals", "*", "visual.json"))):
                 vis_id = os.path.basename(os.path.dirname(vis_path))
                 with open(vis_path, "r") as f:
-                    vis_content = f.read()
-                sections.append(f"### Visual: {vis_id}\n```json\n{vis_content}\n```")
+                    vis_data = json.load(f)
+                slim = _slim_visual_data(vis_data)
+                sections.append(f"### Visual: {vis_id}\n```json\n{json.dumps(slim, indent=2)}\n```")
 
     return "\n\n".join(sections)
 
@@ -837,8 +1033,20 @@ def apply_blueprint_positions(dashboard_json: dict, pbi_layout: PbiLayout) -> di
 # ---------------------------------------------------------------------------
 
 
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 characters per token for mixed code/prose."""
+    return len(text) // 4
+
+
+MAX_PROMPT_TOKENS = 190_000
+
+
 def call_llm(report_name: str, pbi_context: str, layout_blueprint: str = "") -> str:
-    """Send the PBI context to the LLM and return the raw response text."""
+    """Send the PBI context to the LLM and return the raw response text.
+
+    If the assembled prompt exceeds the model's context window, raises a
+    ValueError with an actionable message rather than hitting a 400 error.
+    """
     client = get_llm_client()
 
     blueprint_section = ""
@@ -867,10 +1075,19 @@ def call_llm(report_name: str, pbi_context: str, layout_blueprint: str = "") -> 
 
 Return ONLY the JSON — no markdown fences, no explanation."""
 
+    system_prompt = _get_system_prompt()
+    estimated = _estimate_tokens(system_prompt + user_message)
+    if estimated > MAX_PROMPT_TOKENS:
+        raise ValueError(
+            f"Prompt is too large (~{estimated:,} estimated tokens, limit ~{MAX_PROMPT_TOKENS:,}). "
+            f"The PBI report has too many visuals/tables for a single LLM call. "
+            f"Try reducing the number of pages or visuals in the report."
+        )
+
     response = client.chat.completions.create(
         model=MODEL,
         messages=[
-            {"role": "system", "content": _get_system_prompt()},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ],
         max_tokens=16384,

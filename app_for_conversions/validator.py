@@ -54,12 +54,31 @@ class LayoutFidelityResult:
 
 
 @dataclass
+class TableCoverageResult:
+    """Results of checking whether all PBI semantic model tables appear in dashboard SQL."""
+    pbi_tables: list = field(default_factory=list)  # [{"pbi_table", "source_fqn"}]
+    queried_tables: list = field(default_factory=list)  # [{"pbi_table", "source_fqn", "found_in_datasets": [...]}]
+    missing_tables: list = field(default_factory=list)  # [{"pbi_table", "source_fqn"}]
+
+    @property
+    def passed(self) -> bool:
+        return not self.missing_tables
+
+    @property
+    def coverage_pct(self) -> float:
+        if not self.pbi_tables:
+            return 100.0
+        return len(self.queried_tables) / len(self.pbi_tables) * 100
+
+
+@dataclass
 class ValidationResult:
     """Collects validation errors and warnings for a dashboard JSON."""
     errors: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     sql_results: list = field(default_factory=list)
     layout_fidelity: Optional[LayoutFidelityResult] = None
+    table_coverage: Optional[TableCoverageResult] = None
 
     @property
     def passed(self) -> bool:
@@ -395,5 +414,50 @@ def validate_layout_fidelity(dashboard_json: dict, pbi_layout) -> LayoutFidelity
                     "visual_type": pbi_vis.visual_type,
                     "description": pbi_vis.display_name or pbi_vis.visual_id[:12],
                 })
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Table Coverage Validation
+# ---------------------------------------------------------------------------
+
+
+def validate_table_coverage(dashboard_json: dict, pbi_source_tables: list[dict]) -> TableCoverageResult:
+    """Check that every PBI semantic model table is referenced in the dashboard SQL.
+
+    Collects all SQL from dashboard datasets and checks whether each PBI source
+    table (by its fully-qualified name or its short table name) appears in at
+    least one query.
+    """
+    result = TableCoverageResult(pbi_tables=list(pbi_source_tables))
+    datasets = dashboard_json.get("datasets", [])
+
+    dataset_sql: list[tuple[str, str]] = []
+    for ds in datasets:
+        ds_name = ds.get("name", ds.get("displayName", "<unnamed>"))
+        sql = _get_dataset_sql(ds).lower()
+        dataset_sql.append((ds_name, sql))
+
+    for tbl in pbi_source_tables:
+        fqn = tbl["source_fqn"].lower()
+        short_name = tbl["pbi_table"].lower()
+
+        found_in = []
+        for ds_name, sql in dataset_sql:
+            if fqn in sql or short_name in sql:
+                found_in.append(ds_name)
+
+        if found_in:
+            result.queried_tables.append({
+                "pbi_table": tbl["pbi_table"],
+                "source_fqn": tbl["source_fqn"],
+                "found_in_datasets": found_in,
+            })
+        else:
+            result.missing_tables.append({
+                "pbi_table": tbl["pbi_table"],
+                "source_fqn": tbl["source_fqn"],
+            })
 
     return result
