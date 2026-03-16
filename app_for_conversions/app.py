@@ -21,15 +21,20 @@ from converter import (
     extract_upload,
     find_pbi_folders,
     collect_pbi_context,
+    collect_pbi_context_chunked,
     extract_pbi_source_tables,
     detect_external_sources,
     parse_pbi_layout,
     build_layout_blueprint_prompt,
+    build_free_layout_blueprint_prompt,
+    should_use_free_layout,
     call_llm,
+    call_llm_chunked,
     generate_explanation,
     extract_json_from_response,
     apply_blueprint_positions,
     _estimate_tokens,
+    MAX_PROMPT_TOKENS,
 )
 from validator import validate_dashboard, validate_layout_fidelity, validate_table_coverage
 
@@ -77,6 +82,17 @@ uploaded_file = st.file_uploader(
     help="Zip containing the .pbip file, .Report/ folder, and .SemanticModel/ folder.",
 )
 
+layout_mode = st.radio(
+    "Layout mode",
+    options=["Auto", "Strict", "Free"],
+    horizontal=True,
+    captions=[
+        "The converter will decide the best layout for the report (Strict for simple reports, Free for dense ones)",
+        "The converter will keep the positions from the original PBI report (may not be optimal for grouped visuals and custom visuals, deterministic conversion)",
+        "LLM decides the best layout for the report (better aesthetics, non-deterministic conversion)"
+    ],
+)
+
 convert_clicked = st.button("Convert & Publish", type="primary", use_container_width=True)
 
 # ---------------------------------------------------------------------------
@@ -120,14 +136,21 @@ if convert_clicked:
         pbi_source_tables = extract_pbi_source_tables(semantic_dir)
         data_sources = detect_external_sources(semantic_dir)
         n_visuals = pbi_context.count("### Visual:")
-        n_tables = len(pbi_source_tables)
-        table_list = ", ".join(f"`{t['source_fqn']}`" for t in pbi_source_tables)
-        progress.write(f"Collected **{n_tables} source table(s)** and **{n_visuals} visuals**: {table_list}")
+        physical_tables = [t for t in pbi_source_tables if t.get("table_type") == "physical"]
+        calc_tables = [t for t in pbi_source_tables if t.get("table_type") == "calculated"]
+        internal_tables = [t for t in pbi_source_tables if t.get("table_type") == "internal"]
+        table_list = ", ".join(f"`{t['source_fqn']}`" for t in physical_tables)
+        summary_parts = [f"**{len(physical_tables)} physical table(s)**"]
+        if calc_tables:
+            summary_parts.append(f"**{len(calc_tables)} calculated**")
+        if internal_tables:
+            summary_parts.append(f"{len(internal_tables)} local")
+        progress.write(f"Collected {', '.join(summary_parts)} and **{n_visuals} visuals**: {table_list}")
 
-        external_sources = [s for s in data_sources if not s["is_databricks"]]
+        external_sources = [s for s in data_sources if not s["is_databricks"] and s["source_type"] != "Calculated (PBI)"]
         if external_sources:
             unique_types = sorted({s["source_type"] for s in external_sources})
-            progress.write(f"⚠️ **{len(external_sources)} table(s) use non-Databricks sources:** {', '.join(unique_types)}")
+            progress.write(f"⚠️ **{len(external_sources)} table(s) from external sources:** {', '.join(unique_types)}")
 
         progress.write("📐 Parsing PBI layout structure...")
         pbi_layout = parse_pbi_layout(report_dir)
@@ -142,20 +165,52 @@ if convert_clicked:
             slicer_info = f", {len(pg.page_slicers)} page filter(s)" if pg.page_slicers else ""
             progress.write(f"  Page \"{pg.display_name}\": {', '.join(vis_types) or '(empty)'}{slicer_info}")
 
-        layout_blueprint = build_layout_blueprint_prompt(pbi_layout)
+        if layout_mode == "Auto":
+            free_layout = should_use_free_layout(pbi_layout)
+        else:
+            free_layout = layout_mode == "Free"
+
+        if free_layout:
+            layout_blueprint = build_free_layout_blueprint_prompt(pbi_layout)
+            reason = "selected by user" if layout_mode == "Free" else "dense report detected"
+            progress.write(f"🎨 Using **free layout mode** ({reason} — LLM decides positioning)")
+        else:
+            layout_blueprint = build_layout_blueprint_prompt(pbi_layout)
+            if layout_mode == "Strict":
+                progress.write("📐 Using **strict layout mode** (selected by user — positions from PBI coordinates)")
 
         # --- Phase 2: LLM Conversion ---
         est_tokens = _estimate_tokens(pbi_context + layout_blueprint)
         progress.write(f"📏 Estimated context size: **~{est_tokens:,} tokens** (after compression)")
-        progress.write(f"🤖 Sending to **{MODEL}** for conversion (with layout blueprint)...")
-        raw_response = call_llm(report_name, pbi_context, layout_blueprint)
+
+        use_chunked = est_tokens > MAX_PROMPT_TOKENS
+        if use_chunked:
+            progress.write(
+                f"⚡ Context exceeds single-call limit (~{MAX_PROMPT_TOKENS:,} tokens). "
+                f"Switching to **multi-turn chunked mode** — pages will be sent in batches."
+            )
+            semantic_ctx, page_chunks = collect_pbi_context_chunked(report_dir, semantic_dir)
+            progress.write(f"Split into **{len(page_chunks)} page chunk(s)**")
+            raw_response = call_llm_chunked(
+                report_name,
+                semantic_ctx,
+                page_chunks,
+                layout_blueprint,
+                progress_callback=lambda msg: progress.write(f"  🔄 {msg}"),
+            )
+        else:
+            mode_label = "free layout" if free_layout else "layout blueprint"
+            progress.write(f"🤖 Sending to **{MODEL}** for conversion...")
+            raw_response = call_llm(report_name, pbi_context, layout_blueprint)
+
         progress.write("Received LLM response")
 
         progress.write("🔧 Parsing dashboard JSON...")
         dashboard_json = extract_json_from_response(raw_response)
 
-        progress.write("📐 Enforcing blueprint positions...")
-        dashboard_json = apply_blueprint_positions(dashboard_json, pbi_layout)
+        if not free_layout:
+            progress.write("📐 Enforcing blueprint positions...")
+            dashboard_json = apply_blueprint_positions(dashboard_json, pbi_layout)
 
         n_datasets = len(dashboard_json.get("datasets", []))
         n_pages = len(dashboard_json.get("pages", []))
@@ -181,7 +236,7 @@ if convert_clicked:
         if validation.passed:
             progress.write("✅ **Structural validation passed**")
         else:
-            progress.write(f"⚠️ **Structural validation found {len(validation.errors)} error(s)** — see details below")
+            progress.write(f"⚠️ **Structural validation found {len(validation.errors)} mismatches(s)** — see details below")
 
         progress.write("📐 Validating layout fidelity against PBI source...")
         layout_fidelity = validate_layout_fidelity(dashboard_json, pbi_layout)
@@ -206,13 +261,25 @@ if convert_clicked:
         table_coverage = validate_table_coverage(dashboard_json, pbi_source_tables)
         validation.table_coverage = table_coverage
 
+        n_physical = len(table_coverage.queried_tables) + len(table_coverage.missing_tables)
+        n_calc = len(table_coverage.calculated_tables)
+        n_internal = len(table_coverage.internal_tables)
+
         if table_coverage.passed:
-            progress.write(f"✅ **All {len(table_coverage.pbi_tables)} PBI table(s)** are queried in the dashboard")
+            progress.write(f"✅ **All {len(table_coverage.queried_tables)} physical table(s)** are queried in the dashboard")
         else:
             missing_names = ", ".join(f"`{t['source_fqn']}`" for t in table_coverage.missing_tables)
             progress.write(
-                f"ℹ️ **{len(table_coverage.missing_tables)} table(s)** present in the semantic model but "
+                f"ℹ️ **{len(table_coverage.missing_tables)} physical table(s)** present in the semantic model but "
                 f"not used by any visual in the report: {missing_names}"
+            )
+        if n_calc:
+            progress.write(
+                f"🔧 **{n_calc} calculated table(s)** translated from DAX to SQL (CTEs/subqueries)"
+            )
+        if n_internal:
+            progress.write(
+                f"⏭️ **{n_internal} PBI internal table(s)** skipped (auto-generated date tables)"
             )
 
         # --- Phase 4: Deploy ---
@@ -294,33 +361,74 @@ if convert_clicked:
         with st.expander("Conversion Report", expanded=False):
             st.markdown(explanation)
 
-        # Table coverage
-        with st.expander("Table Coverage", expanded=True):
+        # Tables & Data Sources (unified)
+        has_external = bool(external_sources)
+        section_title = "Tables & Data Sources" if not has_external else "Tables, Data Sources & Migration"
+        with st.expander(section_title, expanded=False):
             tc = validation.table_coverage
+            ds_lookup = {s["pbi_table"]: s for s in data_sources} if data_sources else {}
+
             if tc:
-                if tc.passed:
-                    st.success(f"All {len(tc.pbi_tables)} PBI semantic model table(s) are queried in the dashboard.")
-                else:
-                    st.info(
-                        f"{len(tc.missing_tables)} of {len(tc.pbi_tables)} table(s) are in the semantic model "
-                        f"but not used by any visual in the report, so they were not included in the dashboard datasets."
+                n_physical = len(tc.queried_tables) + len(tc.missing_tables)
+                n_calc = len(tc.calculated_tables)
+                n_internal = len(tc.internal_tables)
+
+                summary_parts = []
+                if tc.passed and n_physical > 0:
+                    summary_parts.append(f"All **{len(tc.queried_tables)} physical table(s)** queried in the dashboard")
+                elif tc.missing_tables:
+                    summary_parts.append(
+                        f"{len(tc.queried_tables)} of {n_physical} physical table(s) queried"
                     )
+                if n_calc:
+                    summary_parts.append(
+                        f"**{n_calc} calculated** (DAX → SQL)"
+                    )
+                if n_internal:
+                    summary_parts.append(f"{n_internal} local PBI table(s)")
+
+                if has_external:
+                    unique_types = sorted({s["source_type"] for s in external_sources})
+                    st.warning(
+                        f"**{len(external_sources)} table(s)** come from external sources "
+                        f"({', '.join(unique_types)}). "
+                        "These need to be accessible from your Databricks workspace."
+                    )
+                elif summary_parts:
+                    st.success(". ".join(summary_parts) + ". No migration needed.")
 
                 table_rows = []
                 for tbl in tc.queried_tables:
+                    ds_info = ds_lookup.get(tbl["pbi_table"], {})
                     table_rows.append({
                         "Status": "✅ Queried",
                         "PBI Table": tbl["pbi_table"],
-                        "Source (catalog.schema.table)": tbl["source_fqn"],
-                        "Used in Dataset(s)": ", ".join(tbl["found_in_datasets"]),
+                        "Source": ds_info.get("source_type", "Databricks"),
+                        "Connection": ds_info.get("connector_detail") or tbl["source_fqn"],
                     })
                 for tbl in tc.missing_tables:
+                    ds_info = ds_lookup.get(tbl["pbi_table"], {})
                     table_rows.append({
                         "Status": "ℹ️ Unused",
                         "PBI Table": tbl["pbi_table"],
-                        "Source (catalog.schema.table)": tbl["source_fqn"],
-                        "Used in Dataset(s)": "—",
+                        "Source": ds_info.get("source_type", "Databricks"),
+                        "Connection": ds_info.get("connector_detail") or tbl["source_fqn"],
                     })
+                for tbl in tc.calculated_tables:
+                    table_rows.append({
+                        "Status": "🔧 Calculated",
+                        "PBI Table": tbl["pbi_table"],
+                        "Source": "DAX → SQL (CTE)",
+                        "Connection": "—",
+                    })
+                for tbl in tc.internal_tables:
+                    table_rows.append({
+                        "Status": "⏭️ Local",
+                        "PBI Table": tbl["pbi_table"],
+                        "Source": "PBI auto-generated",
+                        "Connection": "—",
+                    })
+
                 if table_rows:
                     import pandas as pd
                     df = pd.DataFrame(table_rows)
@@ -331,46 +439,21 @@ if convert_clicked:
                         column_config={
                             "Status": st.column_config.TextColumn(width="small"),
                             "PBI Table": st.column_config.TextColumn(width="medium"),
-                            "Source (catalog.schema.table)": st.column_config.TextColumn(width="large"),
-                            "Used in Dataset(s)": st.column_config.TextColumn(width="medium"),
+                            "Source": st.column_config.TextColumn(width="medium"),
+                            "Connection": st.column_config.TextColumn(width="large"),
                         },
                     )
+
+                if has_external:
+                    st.markdown("### How to bring external data into Databricks")
+                    st.markdown(
+                        "- **Lakehouse Federation** — Query external databases in-place without moving data. "
+                        "Create a *foreign catalog* in Unity Catalog.\n\n"
+                        "- **Lakeflow Connect** — Ingest data into Delta tables with managed CDC pipelines.\n\n"
+                        "- **Lakebridge** — Migrate entire data warehouses and their workloads to Databricks."
+                    )
             else:
-                st.info("Table coverage validation was not run.")
-
-        # Data sources
-        if external_sources:
-            with st.expander("Data Sources & Migration Recommendations", expanded=True):
-                unique_external = sorted({s["source_type"] for s in external_sources})
-                st.warning(
-                    f"**{len(external_sources)} of {len(data_sources)} table(s)** connect to non-Databricks sources "
-                    f"({', '.join(unique_external)}). "
-                    "To use this dashboard on Databricks, these tables need to be accessible from your workspace."
-                )
-
-                source_rows = []
-                for s in data_sources:
-                    source_rows.append({
-                        "Status": "✅ Native" if s["is_databricks"] else "⚠️ External",
-                        "PBI Table": s["pbi_table"],
-                        "Source Type": s["source_type"],
-                        "Connection": s["connector_detail"] or "—",
-                    })
-                st.table(source_rows)
-
-                st.markdown("### How to bring external data into Databricks")
-                st.markdown(
-                    "There are several ways to make external data available in your Databricks workspace:\n\n"
-                    "- **Lakehouse Federation** — Query external databases in-place without moving data. "
-                    "Create a *foreign catalog* in Unity Catalog that maps to the external source. "
-                    "Great for quick access when you don't want to move data.\n\n"
-                    "- **Lakeflow Connect** — Ingest data from external sources into Delta tables on Databricks. "
-                    "Sets up managed pipelines with CDC (change data capture) for continuous sync. "
-                    "Ideal for analytics workloads where you want full Lakehouse performance and governance.\n\n"
-                    "- **Lakebridge** — Migrate entire data warehouses and their workloads to Databricks. "
-                    "Automates the conversion of schemas, queries, and pipelines from legacy platforms. "
-                    "Best for full migrations where you want to decommission the original source."
-                )
+                st.info("Table validation was not run.")
 
         # Validation summary
         with st.expander("Validation Results", expanded=False):

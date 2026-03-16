@@ -56,9 +56,11 @@ class LayoutFidelityResult:
 @dataclass
 class TableCoverageResult:
     """Results of checking whether all PBI semantic model tables appear in dashboard SQL."""
-    pbi_tables: list = field(default_factory=list)  # [{"pbi_table", "source_fqn"}]
+    pbi_tables: list = field(default_factory=list)  # [{"pbi_table", "source_fqn", "table_type"}]
     queried_tables: list = field(default_factory=list)  # [{"pbi_table", "source_fqn", "found_in_datasets": [...]}]
     missing_tables: list = field(default_factory=list)  # [{"pbi_table", "source_fqn"}]
+    calculated_tables: list = field(default_factory=list)  # [{"pbi_table", "source_fqn"}]
+    internal_tables: list = field(default_factory=list)  # [{"pbi_table", "source_fqn"}]
 
     @property
     def passed(self) -> bool:
@@ -66,9 +68,10 @@ class TableCoverageResult:
 
     @property
     def coverage_pct(self) -> float:
-        if not self.pbi_tables:
+        physical = [t for t in self.pbi_tables if t.get("table_type") == "physical"]
+        if not physical:
             return 100.0
-        return len(self.queried_tables) / len(self.pbi_tables) * 100
+        return len(self.queried_tables) / len(physical) * 100
 
 
 @dataclass
@@ -426,9 +429,13 @@ def validate_layout_fidelity(dashboard_json: dict, pbi_layout) -> LayoutFidelity
 def validate_table_coverage(dashboard_json: dict, pbi_source_tables: list[dict]) -> TableCoverageResult:
     """Check that every PBI semantic model table is referenced in the dashboard SQL.
 
-    Collects all SQL from dashboard datasets and checks whether each PBI source
-    table (by its fully-qualified name or its short table name) appears in at
-    least one query.
+    Tables are classified by type:
+      - "physical": checked against dashboard SQL for coverage
+      - "calculated": reported separately (their DAX logic is translated to SQL
+        using the underlying physical tables, so the calculated table name won't
+        appear literally in the SQL)
+      - "internal": PBI auto-generated tables (LocalDateTable_, DateTableTemplate_)
+        that are excluded from coverage checks
     """
     result = TableCoverageResult(pbi_tables=list(pbi_source_tables))
     datasets = dashboard_json.get("datasets", [])
@@ -440,6 +447,22 @@ def validate_table_coverage(dashboard_json: dict, pbi_source_tables: list[dict])
         dataset_sql.append((ds_name, sql))
 
     for tbl in pbi_source_tables:
+        table_type = tbl.get("table_type", "physical")
+
+        if table_type == "internal":
+            result.internal_tables.append({
+                "pbi_table": tbl["pbi_table"],
+                "source_fqn": tbl["source_fqn"],
+            })
+            continue
+
+        if table_type == "calculated":
+            result.calculated_tables.append({
+                "pbi_table": tbl["pbi_table"],
+                "source_fqn": tbl["source_fqn"],
+            })
+            continue
+
         fqn = tbl["source_fqn"].lower()
         short_name = tbl["pbi_table"].lower()
 

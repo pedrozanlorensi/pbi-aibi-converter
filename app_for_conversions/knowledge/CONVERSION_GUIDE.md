@@ -104,6 +104,10 @@ PBI uses numeric function codes in `Aggregation.Function`:
 | 4 | Max | `MAX(col)` | `{"name": "max(col)", "expression": "MAX(\`col\`)"}` |
 | 5 | CountNonNull (distinct) | `COUNT(DISTINCT col)` | `{"name": "countdistinct(col)", "expression": "COUNT(DISTINCT \`col\`)"}` |
 
+> **For complex DAX patterns** (CALCULATE, DIVIDE, IF, SWITCH, time intelligence, VAR/RETURN, SELECTEDVALUE, iterator functions, ALL/ALLEXCEPT), see the **DAX TO SQL TRANSLATION GUIDE** for detailed side-by-side DAX → Spark SQL examples and placement rules.
+
+> **IMPORTANT: Prefer custom calculations.** DAX measures should become widget-level `expression` fields (custom calculations) rather than derived columns in dataset SQL. This makes the measures visible and editable in the dashboard UI. Dataset SQL should only contain base tables, JOINs, CTEs for calculated tables, and window functions. Example: DAX `DIVIDE(SUM(Sales[Amount]), COUNTROWS(Sales))` becomes a widget field: `{"name": "avg_sale", "expression": "SUM(\`amount\`) / NULLIF(COUNT(*), 0)"}`.
+
 ### Step 5: Translate PBI Relationships to SQL JOINs
 
 PBI relationships in `relationships.tmdl`:
@@ -131,9 +135,9 @@ Unlike PBI's semantic model where tables are separate and related, AI/BI dashboa
 **Design principles:**
 - One dataset per analytical domain (don't create one per visual)
 - Include all dimension columns that filters will use
-- Include all measure base columns that widgets will aggregate
+- Include all **base columns** that widget custom calculations will reference
 - Use fully-qualified table names: `catalog.schema.table`
-- Push complex logic (CASE/WHEN, COALESCE) into the SQL query
+- **Keep datasets lean**: JOINs, WHERE clauses, CTEs for calculated tables, and window functions belong here. Avoid pre-computing aggregated measures — let widget custom calculations handle aggregations (SUM, COUNT, CASE WHEN, DIVIDE, etc.)
 
 **Example:**
 ```json
