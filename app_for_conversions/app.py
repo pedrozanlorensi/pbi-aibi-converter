@@ -21,14 +21,17 @@ from converter import (
     extract_upload,
     find_pbi_folders,
     collect_pbi_context,
+    extract_pbi_source_tables,
+    detect_external_sources,
     parse_pbi_layout,
     build_layout_blueprint_prompt,
     call_llm,
     generate_explanation,
     extract_json_from_response,
     apply_blueprint_positions,
+    _estimate_tokens,
 )
-from validator import validate_dashboard, validate_layout_fidelity
+from validator import validate_dashboard, validate_layout_fidelity, validate_table_coverage
 
 # ---------------------------------------------------------------------------
 # Page config (must be the first Streamlit command)
@@ -114,9 +117,17 @@ if convert_clicked:
 
         progress.write("🔍 Reading PBI report files...")
         pbi_context = collect_pbi_context(report_dir, semantic_dir)
+        pbi_source_tables = extract_pbi_source_tables(semantic_dir)
+        data_sources = detect_external_sources(semantic_dir)
         n_visuals = pbi_context.count("### Visual:")
-        n_tables = pbi_context.count("### Table:")
-        progress.write(f"Collected **{n_tables} tables** and **{n_visuals} visuals**")
+        n_tables = len(pbi_source_tables)
+        table_list = ", ".join(f"`{t['source_fqn']}`" for t in pbi_source_tables)
+        progress.write(f"Collected **{n_tables} source table(s)** and **{n_visuals} visuals**: {table_list}")
+
+        external_sources = [s for s in data_sources if not s["is_databricks"]]
+        if external_sources:
+            unique_types = sorted({s["source_type"] for s in external_sources})
+            progress.write(f"⚠️ **{len(external_sources)} table(s) use non-Databricks sources:** {', '.join(unique_types)}")
 
         progress.write("📐 Parsing PBI layout structure...")
         pbi_layout = parse_pbi_layout(report_dir)
@@ -134,6 +145,8 @@ if convert_clicked:
         layout_blueprint = build_layout_blueprint_prompt(pbi_layout)
 
         # --- Phase 2: LLM Conversion ---
+        est_tokens = _estimate_tokens(pbi_context + layout_blueprint)
+        progress.write(f"📏 Estimated context size: **~{est_tokens:,} tokens** (after compression)")
         progress.write(f"🤖 Sending to **{MODEL}** for conversion (with layout blueprint)...")
         raw_response = call_llm(report_name, pbi_context, layout_blueprint)
         progress.write("Received LLM response")
@@ -188,6 +201,19 @@ if convert_clicked:
 
         if layout_fidelity.position_warnings:
             progress.write(f"ℹ️ {len(layout_fidelity.position_warnings)} widget(s) with position drift from PBI source")
+
+        progress.write("📊 Validating table coverage...")
+        table_coverage = validate_table_coverage(dashboard_json, pbi_source_tables)
+        validation.table_coverage = table_coverage
+
+        if table_coverage.passed:
+            progress.write(f"✅ **All {len(table_coverage.pbi_tables)} PBI table(s)** are queried in the dashboard")
+        else:
+            missing_names = ", ".join(f"`{t['source_fqn']}`" for t in table_coverage.missing_tables)
+            progress.write(
+                f"ℹ️ **{len(table_coverage.missing_tables)} table(s)** present in the semantic model but "
+                f"not used by any visual in the report: {missing_names}"
+            )
 
         # --- Phase 4: Deploy ---
         progress.write("🚀 Deploying to Databricks workspace...")
@@ -267,6 +293,84 @@ if convert_clicked:
         # Conversion explanation (shown first)
         with st.expander("Conversion Report", expanded=False):
             st.markdown(explanation)
+
+        # Table coverage
+        with st.expander("Table Coverage", expanded=True):
+            tc = validation.table_coverage
+            if tc:
+                if tc.passed:
+                    st.success(f"All {len(tc.pbi_tables)} PBI semantic model table(s) are queried in the dashboard.")
+                else:
+                    st.info(
+                        f"{len(tc.missing_tables)} of {len(tc.pbi_tables)} table(s) are in the semantic model "
+                        f"but not used by any visual in the report, so they were not included in the dashboard datasets."
+                    )
+
+                table_rows = []
+                for tbl in tc.queried_tables:
+                    table_rows.append({
+                        "Status": "✅ Queried",
+                        "PBI Table": tbl["pbi_table"],
+                        "Source (catalog.schema.table)": tbl["source_fqn"],
+                        "Used in Dataset(s)": ", ".join(tbl["found_in_datasets"]),
+                    })
+                for tbl in tc.missing_tables:
+                    table_rows.append({
+                        "Status": "ℹ️ Unused",
+                        "PBI Table": tbl["pbi_table"],
+                        "Source (catalog.schema.table)": tbl["source_fqn"],
+                        "Used in Dataset(s)": "—",
+                    })
+                if table_rows:
+                    import pandas as pd
+                    df = pd.DataFrame(table_rows)
+                    st.dataframe(
+                        df,
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "Status": st.column_config.TextColumn(width="small"),
+                            "PBI Table": st.column_config.TextColumn(width="medium"),
+                            "Source (catalog.schema.table)": st.column_config.TextColumn(width="large"),
+                            "Used in Dataset(s)": st.column_config.TextColumn(width="medium"),
+                        },
+                    )
+            else:
+                st.info("Table coverage validation was not run.")
+
+        # Data sources
+        if external_sources:
+            with st.expander("Data Sources & Migration Recommendations", expanded=True):
+                unique_external = sorted({s["source_type"] for s in external_sources})
+                st.warning(
+                    f"**{len(external_sources)} of {len(data_sources)} table(s)** connect to non-Databricks sources "
+                    f"({', '.join(unique_external)}). "
+                    "To use this dashboard on Databricks, these tables need to be accessible from your workspace."
+                )
+
+                source_rows = []
+                for s in data_sources:
+                    source_rows.append({
+                        "Status": "✅ Native" if s["is_databricks"] else "⚠️ External",
+                        "PBI Table": s["pbi_table"],
+                        "Source Type": s["source_type"],
+                        "Connection": s["connector_detail"] or "—",
+                    })
+                st.table(source_rows)
+
+                st.markdown("### How to bring external data into Databricks")
+                st.markdown(
+                    "There are several ways to make external data available in your Databricks workspace:\n\n"
+                    "- **Lakehouse Federation** — Query external databases in-place without moving data. "
+                    "Create a *foreign catalog* in Unity Catalog that maps to the external source. "
+                    "Great for quick access when you don't want to move data.\n\n"
+                    "- **Lakeflow Connect** — Ingest data from external sources into Delta tables on Databricks. "
+                    "Sets up managed pipelines with CDC (change data capture) for continuous sync. "
+                    "Ideal for analytics workloads where you want full Lakehouse performance and governance.\n\n"
+                    "- **Lakebridge** — Migrate entire data warehouses and their workloads to Databricks. "
+                    "Automates the conversion of schemas, queries, and pipelines from legacy platforms. "
+                    "Best for full migrations where you want to decommission the original source."
+                )
 
         # Validation summary
         with st.expander("Validation Results", expanded=False):
