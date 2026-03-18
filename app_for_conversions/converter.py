@@ -1326,17 +1326,32 @@ Return ONLY the JSON — no markdown fences, no explanation."""
             f"Try reducing the number of pages or visuals in the report."
         )
 
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        max_tokens=16384,
-        temperature=0,
-    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
 
-    return response.choices[0].message.content
+    full_response = ""
+
+    while True:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            max_tokens=32768,
+            temperature=0,
+        )
+
+        chunk = response.choices[0].message.content or ""
+        full_response += chunk
+
+        finish = getattr(response.choices[0], "finish_reason", None)
+        if finish != "length":
+            break
+
+        messages.append({"role": "assistant", "content": chunk})
+        messages.append({"role": "user", "content": "The JSON was truncated. Continue EXACTLY where you left off — output only the remaining JSON, no repetition, no explanation."})
+
+    return full_response
 
 
 CHUNK_TOKEN_BUDGET = 150_000
