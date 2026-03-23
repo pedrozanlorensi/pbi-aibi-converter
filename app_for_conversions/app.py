@@ -33,6 +33,8 @@ from converter import (
     generate_explanation,
     extract_json_from_response,
     apply_blueprint_positions,
+    _ensure_fqn_tables,
+    fix_dataset_columns,
     _estimate_tokens,
     MAX_PROMPT_TOKENS,
 )
@@ -217,8 +219,7 @@ if convert_clicked:
         n_widgets = sum(len(p.get("layout", [])) for p in dashboard_json.get("pages", []))
         progress.write(f"Generated **{n_datasets} datasets**, **{n_pages} pages**, **{n_widgets} widgets**")
 
-        # --- Phase 3: Validation ---
-        progress.write("🔍 Validating dashboard...")
+        # --- Phase 3: SQL column check & fix ---
         sp_client = WorkspaceClient()
 
         warehouse_id = os.getenv("DATABRICKS_WAREHOUSE_ID")
@@ -231,6 +232,14 @@ if convert_clicked:
             st.error("No SQL warehouse found. Please set DATABRICKS_WAREHOUSE_ID.")
             st.stop()
 
+        progress.write("🔗 Ensuring fully-qualified table names (catalog.schema.table)...")
+        dashboard_json = _ensure_fqn_tables(dashboard_json)
+
+        progress.write("🔍 Checking dataset SQL against UC tables...")
+        dashboard_json = fix_dataset_columns(dashboard_json, warehouse_id, sp_client)
+
+        # --- Phase 4: Validation ---
+        progress.write("🔍 Validating dashboard...")
         validation = validate_dashboard(dashboard_json, warehouse_id, sp_client)
 
         if validation.passed:

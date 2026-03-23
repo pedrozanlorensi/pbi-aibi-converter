@@ -1752,6 +1752,342 @@ def _promote_aggregations_to_custom_calcs(dashboard_json: dict) -> dict:
     return dashboard_json
 
 
+def _sanitize_widget_columns(dashboard_json: dict) -> dict:
+    """Ensure widget field expressions only reference columns that exist in their dataset.
+
+    Parses each dataset SQL with sqlglot to extract output column names,
+    then checks every widget field expression for invalid column references.
+    Attempts case-insensitive correction when possible; removes unfixable
+    fields and their corresponding encodings to prevent broken widgets.
+    """
+    try:
+        import re
+        import sqlglot
+        from sqlglot import exp as E
+    except ImportError:
+        return dashboard_json
+
+    datasets = dashboard_json.get("datasets", [])
+    pages = dashboard_json.get("pages", [])
+
+    ds_col_map: dict[str, set[str]] = {}
+    for ds in datasets:
+        ds_name = ds.get("name", "")
+        query = ds.get("query", "")
+        if not query:
+            continue
+        try:
+            tree = sqlglot.parse_one(query, dialect="spark")
+            ds_col_map[ds_name] = {sel.alias_or_name for sel in tree.selects}
+        except Exception:
+            continue
+
+    if not ds_col_map:
+        return dashboard_json
+
+    for page in pages:
+        for item in page.get("layout", []):
+            widget = item.get("widget", {})
+            if not widget:
+                continue
+
+            spec = widget.get("spec", {})
+            encodings = spec.get("encodings", {}) if isinstance(spec, dict) else {}
+
+            for wq in widget.get("queries", []):
+                query_obj = wq.get("query", {})
+                ds_ref = query_obj.get("datasetName", "")
+
+                if ds_ref not in ds_col_map:
+                    continue
+
+                ds_cols = ds_col_map[ds_ref]
+                ds_cols_lower = {c.lower(): c for c in ds_cols}
+
+                fields_to_remove = []
+                for field in query_obj.get("fields", []):
+                    expr = field.get("expression", "")
+                    refs = set(re.findall(r"`([^`]+)`", expr))
+
+                    for ref_col in refs:
+                        if ref_col in ds_cols:
+                            continue
+
+                        lower_match = ds_cols_lower.get(ref_col.lower())
+                        if lower_match:
+                            expr = expr.replace(f"`{ref_col}`", f"`{lower_match}`")
+                            field["expression"] = expr
+                        else:
+                            fields_to_remove.append(field)
+                            break
+
+                for bad_field in fields_to_remove:
+                    old_name = bad_field.get("name", "")
+                    query_obj["fields"].remove(bad_field)
+                    _update_encoding_field_name(encodings, old_name, "")
+                    for enc_key in list(encodings.keys()):
+                        enc_val = encodings[enc_key]
+                        if isinstance(enc_val, dict) and enc_val.get("fieldName") == "":
+                            del encodings[enc_key]
+                        elif isinstance(enc_val, list):
+                            encodings[enc_key] = [
+                                item for item in enc_val
+                                if not (isinstance(item, dict) and item.get("fieldName") == "")
+                            ]
+
+    return dashboard_json
+
+
+def _ensure_fqn_tables(dashboard_json: dict) -> dict:
+    """Ensure every table reference in dataset SQL uses the 3-level namespace (catalog.schema.table).
+
+    Strategy:
+      1. Parse all dataset queries to collect every table reference.
+      2. From the 3-part references, infer the most common catalog and schema.
+      3. For tables with <3 parts, prepend the missing catalog/schema.
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp as E
+    except ImportError:
+        return dashboard_json
+
+    from collections import Counter
+
+    catalogs: Counter = Counter()
+    schemas: Counter = Counter()
+
+    for ds in dashboard_json.get("datasets", []):
+        sql = ds.get("query", "")
+        if not sql.strip():
+            continue
+        try:
+            tree = sqlglot.parse_one(sql, dialect="spark")
+            for tbl in tree.find_all(E.Table):
+                if tbl.catalog and tbl.db and tbl.name:
+                    catalogs[tbl.catalog] += 1
+                    schemas[f"{tbl.catalog}.{tbl.db}"] += 1
+        except Exception:
+            continue
+
+    if not catalogs:
+        return dashboard_json
+
+    default_catalog = catalogs.most_common(1)[0][0]
+    default_schema_fqn = schemas.most_common(1)[0][0] if schemas else None
+    default_schema = default_schema_fqn.split(".", 1)[1] if default_schema_fqn else None
+
+    for ds in dashboard_json.get("datasets", []):
+        sql = ds.get("query", "")
+        if not sql.strip():
+            continue
+        try:
+            tree = sqlglot.parse_one(sql, dialect="spark")
+            modified = False
+
+            for tbl in tree.find_all(E.Table):
+                has_catalog = bool(tbl.catalog)
+                has_schema = bool(tbl.db)
+                has_table = bool(tbl.name)
+
+                if not has_table:
+                    continue
+
+                if has_catalog and has_schema:
+                    continue
+
+                if has_schema and not has_catalog:
+                    tbl.set("catalog", E.Identifier(this=default_catalog, quoted=True))
+                    modified = True
+                elif not has_schema and not has_catalog and default_schema:
+                    tbl.set("db", E.Identifier(this=default_schema, quoted=True))
+                    tbl.set("catalog", E.Identifier(this=default_catalog, quoted=True))
+                    modified = True
+
+            if modified:
+                ds["query"] = tree.sql(dialect="spark")
+        except Exception:
+            continue
+
+    return dashboard_json
+
+
+def fix_dataset_columns(dashboard_json: dict, warehouse_id: str, sp_client) -> dict:
+    """Execute each dataset query and auto-fix invalid column references.
+
+    For each dataset SQL:
+      1. Try executing with LIMIT 0.
+      2. If it fails with a column-not-found error, extract the bad column name.
+      3. DESCRIBE the referenced tables to get real columns.
+      4. Find the closest match (case-insensitive, then Levenshtein-like).
+      5. Replace the bad column in the SQL and retry.
+
+    Retries up to 3 times per dataset to fix multiple bad columns.
+    """
+    import re
+
+    try:
+        from databricks.sdk.service.sql import StatementState
+    except ImportError:
+        return dashboard_json
+
+    def _run_query(sql: str) -> tuple[bool, str]:
+        try:
+            stmt = sp_client.statement_execution.execute_statement(
+                warehouse_id=warehouse_id,
+                statement=f"SELECT * FROM ({sql}) AS _t LIMIT 0",
+                wait_timeout="30s",
+            )
+            if stmt.status and stmt.status.state == StatementState.SUCCEEDED:
+                return True, ""
+            error_msg = stmt.status.error.message if stmt.status and stmt.status.error else "Unknown"
+            return False, error_msg
+        except Exception as e:
+            return False, str(e)
+
+    def _extract_bad_column(error_msg: str) -> str | None:
+        for pattern in [
+            r"UNRESOLVED_COLUMN\.WITH_SUGGESTION.*?`([^`]+)`",
+            r"cannot be resolved.*?`([^`]+)`",
+            r"Column '([^']+)' does not exist",
+            r"COLUMN_NOT_FOUND.*?`([^`]+)`",
+            r"cannot resolve '([^']+)'",
+        ]:
+            m = re.search(pattern, error_msg, re.IGNORECASE)
+            if m:
+                return m.group(1)
+        return None
+
+    def _best_column_match(bad_col: str, available: list[str]) -> str | None:
+        lower_map = {c.lower(): c for c in available}
+        if bad_col.lower() in lower_map:
+            return lower_map[bad_col.lower()]
+
+        stripped = bad_col.replace("_", "").lower()
+        for col in available:
+            if col.replace("_", "").lower() == stripped:
+                return col
+
+        best, best_score = None, 0
+        bad_lower = bad_col.lower()
+        for col in available:
+            col_lower = col.lower()
+            common = sum(1 for a, b in zip(bad_lower, col_lower) if a == b)
+            score = common / max(len(bad_lower), len(col_lower))
+            if score > best_score and score > 0.6:
+                best_score = score
+                best = col
+        return best
+
+    def _get_table_columns(sql: str) -> dict[str, list[str]]:
+        table_cols = {}
+        try:
+            import sqlglot
+            from sqlglot import exp as E
+            tree = sqlglot.parse_one(sql, dialect="spark")
+            for table in tree.find_all(E.Table):
+                parts = []
+                if table.catalog:
+                    parts.append(table.catalog)
+                if table.db:
+                    parts.append(table.db)
+                parts.append(table.name)
+                if len(parts) >= 2:
+                    fqn = ".".join(parts)
+                    if fqn in table_cols:
+                        continue
+                    try:
+                        stmt = sp_client.statement_execution.execute_statement(
+                            warehouse_id=warehouse_id,
+                            statement=f"DESCRIBE TABLE {fqn}",
+                            wait_timeout="15s",
+                        )
+                        if stmt.status and stmt.status.state == StatementState.SUCCEEDED:
+                            table_cols[fqn] = [
+                                row[0] for row in (stmt.result.data_array or [])
+                                if row and row[0] and not row[0].startswith("#")
+                            ]
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return table_cols
+
+    # Track column renames per dataset: ds_name -> {old_col: new_col}
+    dataset_renames: dict[str, dict[str, str]] = {}
+
+    for ds in dashboard_json.get("datasets", []):
+        ds_name = ds.get("name", "")
+        query = ds.get("query", "")
+        if not query.strip():
+            continue
+
+        renames: dict[str, str] = {}
+        for _attempt in range(5):
+            ok, error = _run_query(query)
+            if ok:
+                break
+
+            bad_col = _extract_bad_column(error)
+            if not bad_col:
+                break
+
+            all_table_cols = _get_table_columns(query)
+            all_available = [c for cols in all_table_cols.values() for c in cols]
+
+            replacement = _best_column_match(bad_col, all_available)
+            if not replacement:
+                break
+
+            query = re.sub(
+                rf"(?<![a-zA-Z0-9_]){re.escape(bad_col)}(?![a-zA-Z0-9_])",
+                replacement,
+                query,
+            )
+            ds["query"] = query
+            renames[bad_col] = replacement
+
+        if renames:
+            dataset_renames[ds_name] = renames
+
+    # Propagate column renames to widget expressions and encodings
+    if dataset_renames:
+        for page in dashboard_json.get("pages", []):
+            for item in page.get("layout", []):
+                widget = item.get("widget", {})
+                if not widget:
+                    continue
+
+                spec = widget.get("spec", {})
+                encodings = spec.get("encodings", {}) if isinstance(spec, dict) else {}
+
+                for wq in widget.get("queries", []):
+                    query_obj = wq.get("query", {})
+                    ds_ref = query_obj.get("datasetName", "")
+
+                    if ds_ref not in dataset_renames:
+                        continue
+
+                    col_renames = dataset_renames[ds_ref]
+
+                    for field in query_obj.get("fields", []):
+                        expr = field.get("expression", "")
+                        name = field.get("name", "")
+
+                        for old_col, new_col in col_renames.items():
+                            if f"`{old_col}`" in expr:
+                                expr = expr.replace(f"`{old_col}`", f"`{new_col}`")
+                                field["expression"] = expr
+
+                            if old_col in name:
+                                new_name = name.replace(old_col, new_col)
+                                _update_encoding_field_name(encodings, name, new_name)
+                                field["name"] = new_name
+                                name = new_name
+
+    return dashboard_json
+
+
 def _format_sql(sql: str) -> str:
     """Format a SQL string for readability using sqlglot."""
     try:
@@ -1794,4 +2130,5 @@ def extract_json_from_response(text: str) -> dict:
 
     dashboard = json.loads(text)
     dashboard = _promote_aggregations_to_custom_calcs(dashboard)
+    dashboard = _sanitize_widget_columns(dashboard)
     return _format_dashboard_sql(dashboard)

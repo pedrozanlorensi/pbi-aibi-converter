@@ -99,6 +99,52 @@ def _get_dataset_sql(ds: dict) -> str:
     return ds.get("query", "")
 
 
+def _extract_fqn_tables(sql: str) -> list[str]:
+    """Extract fully-qualified table names (catalog.schema.table) from a SQL query."""
+    try:
+        import sqlglot
+        from sqlglot import exp as E
+        tree = sqlglot.parse_one(sql, dialect="spark")
+        tables = []
+        for table in tree.find_all(E.Table):
+            parts = []
+            if table.catalog:
+                parts.append(table.catalog)
+            if table.db:
+                parts.append(table.db)
+            parts.append(table.name)
+            if len(parts) >= 2:
+                tables.append(".".join(parts))
+        return tables
+    except Exception:
+        return []
+
+
+def _describe_table(sp_client, warehouse_id: str, fqn: str) -> list[str] | None:
+    """Return column names for a UC table, or None on failure."""
+    try:
+        from databricks.sdk.service.sql import StatementState
+        stmt = sp_client.statement_execution.execute_statement(
+            warehouse_id=warehouse_id,
+            statement=f"DESCRIBE TABLE {fqn}",
+            wait_timeout="15s",
+        )
+        if stmt.status and stmt.status.state == StatementState.SUCCEEDED:
+            return [
+                row[0] for row in (stmt.result.data_array or [])
+                if row and row[0] and not row[0].startswith("#")
+            ]
+    except Exception:
+        pass
+    return None
+
+
+def _extract_column_refs(expression: str) -> set[str]:
+    """Extract backtick-quoted column references from a widget expression."""
+    import re
+    return set(re.findall(r"`([^`]+)`", expression))
+
+
 def validate_dashboard(dashboard_json: dict, warehouse_id: str, sp_client: WorkspaceClient) -> ValidationResult:
     """Validate the generated .lvdash.json for structural correctness and SQL validity.
 
@@ -125,6 +171,8 @@ def validate_dashboard(dashboard_json: dict, warehouse_id: str, sp_client: Works
 
     # --- Dataset validation + SQL execution ---
     dataset_names = set()
+    dataset_columns: dict[str, set[str]] = {}
+
     for ds in datasets:
         ds_name = ds.get("name", "<unnamed>")
         dataset_names.add(ds_name)
@@ -148,10 +196,19 @@ def validate_dashboard(dashboard_json: dict, warehouse_id: str, sp_client: Works
             if stmt.status and stmt.status.state == StatementState.SUCCEEDED:
                 cols = [c.name for c in (stmt.manifest.schema.columns or [])] if stmt.manifest and stmt.manifest.schema else []
                 result.sql_results.append((ds_name, True, None, cols))
+                dataset_columns[ds_name] = set(cols)
             else:
                 error_msg = stmt.status.error.message if stmt.status and stmt.status.error else "Unknown error"
                 result.errors.append(f"Dataset `{ds_name}`: SQL query failed — {error_msg}")
                 result.sql_results.append((ds_name, False, error_msg, []))
+
+                for fqn in _extract_fqn_tables(query_str):
+                    table_cols = _describe_table(sp_client, warehouse_id, fqn)
+                    if table_cols:
+                        result.errors.append(
+                            f"  ↳ Table `{fqn}` available columns: {', '.join(table_cols)}"
+                        )
+
         except Exception as e:
             result.errors.append(f"Dataset `{ds_name}`: SQL execution error — {e}")
             result.sql_results.append((ds_name, False, str(e), []))
@@ -216,6 +273,18 @@ def validate_dashboard(dashboard_json: dict, warehouse_id: str, sp_client: Works
                     fname = f.get("name", "")
                     if fname:
                         query_field_names.add(fname)
+
+                    # Check that columns in expression exist in dataset result
+                    expr = f.get("expression", "")
+                    if ds_ref and ds_ref in dataset_columns and expr:
+                        ds_cols = dataset_columns[ds_ref]
+                        for ref_col in _extract_column_refs(expr):
+                            if ref_col not in ds_cols:
+                                result.errors.append(
+                                    f"Widget `{w_name}` on `{page_name}`: expression `{expr}` "
+                                    f"references column `{ref_col}` not found in dataset `{ds_ref}` "
+                                    f"(available: {', '.join(sorted(ds_cols))})"
+                                )
 
             # Dataset reference check
             for ds_ref in referenced_datasets:
