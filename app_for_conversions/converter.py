@@ -1640,6 +1640,7 @@ def call_llm(
     pbi_context: str,
     layout_blueprint: str = "",
     color_context: str = "",
+    custom_instructions: str = "",
 ) -> str:
     """Send the PBI context to the LLM and return the raw response text.
 
@@ -1673,7 +1674,7 @@ def call_llm(
 7. Ensure all field names in query.fields match fieldNames in encodings exactly
 8. **CRITICAL: Follow the LAYOUT BLUEPRINT above exactly — same number of pages, same visuals, same approximate positions**
 9. **Preserve the PBI color palette** — for charts with categorical color encodings, use `scale.range` with the PBI theme colors
-
+{f"10. **USER CUSTOM INSTRUCTIONS (follow these with highest priority):**{chr(10)}{custom_instructions}" if custom_instructions and custom_instructions.strip() else ""}
 Return ONLY the JSON — no markdown fences, no explanation."""
 
     system_prompt = _get_system_prompt()
@@ -1722,6 +1723,7 @@ def call_llm_chunked(
     page_chunks: list[tuple[str, str]],
     layout_blueprint: str = "",
     color_context: str = "",
+    custom_instructions: str = "",
     progress_callback=None,
 ) -> str:
     """Convert a large PBI report using multi-turn chat, sending pages in batches.
@@ -1792,6 +1794,8 @@ def call_llm_chunked(
                 f"7. Ensure all field names in query.fields match fieldNames in encodings exactly\n"
                 f"8. Preserve the PBI color palette in charts with categorical color encodings using scale.range\n"
             )
+            if custom_instructions and custom_instructions.strip():
+                user_msg += f"9. **USER CUSTOM INSTRUCTIONS (follow these with highest priority):**\n{custom_instructions}\n"
             if len(batches) > 1:
                 user_msg += (
                     f"\nSince there are more batches coming, generate the dashboard JSON for these pages now. "
