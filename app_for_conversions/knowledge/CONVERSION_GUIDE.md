@@ -329,7 +329,36 @@ PBI slicers are placed directly on the page canvas. In AI/BI, you choose between
 
 **When to use global filters:** Only create a `PAGE_TYPE_GLOBAL_FILTERS` page when there are truly global slicers — i.e., in a multi-page report where the same slicer field appears on every page. In a single-page report, all slicers are always page-level.
 
-### Step 10: Test and Deploy
+### Step 10: Preserve Colors
+
+PBI reports store colors in two places:
+1. **Base theme** (`StaticResources/SharedResources/BaseThemes/*.json`) — contains the `dataColors` palette (array of hex strings) used by all charts in order
+2. **Per-visual overrides** (`objects.dataPoint` in `visual.json`) — explicit color assignments for specific data points or series
+
+To preserve colors in AI/BI:
+- For charts with a categorical `color` encoding, add `scale.range` with hex colors from the PBI palette:
+```json
+"color": {
+  "fieldName": "product",
+  "scale": {"type": "categorical", "range": ["#118DFF", "#12239E", "#E66C37"]},
+  "displayName": "Product"
+}
+```
+- If specific category-to-color mappings are known, also include `scale.domain`:
+```json
+"color": {
+  "fieldName": "region",
+  "scale": {
+    "type": "categorical",
+    "domain": ["North", "South", "East"],
+    "range": ["#118DFF", "#12239E", "#E66C37"]
+  },
+  "displayName": "Region"
+}
+```
+- Use the first N colors from the palette (in order) where N is the expected number of distinct categories.
+
+### Step 11: Test and Deploy
 
 Before deploying, always:
 1. **Test every dataset query** with `execute_sql()` to verify it returns data
@@ -392,7 +421,7 @@ Extract from this:
 
 ## Example: Bakehouse Report Conversion
 
-The included `BakehouseSalesHighlights.lvdash.json` was converted from the PBI report in `input/`. Here's the mapping:
+The `BakehouseSalesHighlights.lvdash.json` dashboard was converted from the Bakehouse PBI report. Here's the mapping:
 
 | PBI Visual | Type | AI/BI Widget | Type |
 |-----------|------|-------------|------|
