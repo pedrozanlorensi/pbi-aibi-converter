@@ -79,6 +79,11 @@ Below are three comprehensive reference documents you MUST follow exactly. They 
 8. **Simple aggregates in dataset SQL are OK**: Simple aggregations like `SUM(col)`, `COUNT(col)`, `AVG(col)` in dataset SQL will be automatically promoted to widget custom calculations by the post-processor. You may use GROUP BY with simple aggregates freely.
 9. **Complex expressions stay in dataset SQL**: For complex DAX translations (CALCULATE → `CASE WHEN` inside aggregates, DIVIDE → `SUM(a) / NULLIF(SUM(b), 0)`, IF/SWITCH), keep them as derived columns in dataset SQL with GROUP BY. AIBI widget expressions only support simple `SUM(\`col\`)` / `COUNT(\`col\`)` / `AVG(\`col\`)` / `MIN(\`col\`)` / `MAX(\`col\`)` — NOT `CASE WHEN`, `NULLIF`, or arithmetic.
 10. **Calculated tables**: PBI tables with `partition = calculated` have NO external data source — their data is defined by a DAX expression. Translate the DAX table expression to an equivalent SQL subquery or CTE (e.g. `DISTINCT(SELECTCOLUMNS(...))` → `SELECT DISTINCT ...`, `DATATABLE(...)` → `UNION ALL` values). Use these as CTEs in datasets that feed the widgets referencing those tables. See REFERENCE 3, section 16.
+11. **Color preservation**: When a COLOR PALETTE section is provided, preserve the PBI report's colors in chart widgets. For charts with a categorical `color` encoding, include a `scale.range` array with hex colors from the PBI palette. Example:
+    ```json
+    "color": {{"fieldName": "product", "scale": {{"type": "categorical", "range": ["#118DFF", "#12239E", "#E66C37"]}}, "displayName": "Product"}}
+    ```
+    If specific category-to-color mappings are given, also include `scale.domain` with the category values in the same order as the `scale.range` colors.
 
 ## OUTPUT FORMAT
 Return ONLY a valid JSON object — the .lvdash.json content. No markdown fences, no explanation, just the JSON."""
@@ -332,6 +337,200 @@ def detect_external_sources(semantic_model_dir: str) -> list[dict]:
     return results
 
 
+# ---------------------------------------------------------------------------
+# PBI Color Extraction
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PbiColorPalette:
+    """Holds extracted color information from a PBI report."""
+    data_colors: list[str] = field(default_factory=list)
+    semantic_colors: dict[str, str] = field(default_factory=dict)
+    visual_colors: dict[str, list[dict]] = field(default_factory=dict)
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    hex_color = hex_color.lstrip("#")
+    return (
+        int(hex_color[0:2], 16),
+        int(hex_color[2:4], 16),
+        int(hex_color[4:6], 16),
+    )
+
+
+def _rgb_to_hex(r: int, g: int, b: int) -> str:
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def _adjust_color_brightness(hex_color: str, percent: float) -> str:
+    """Apply a PBI ThemeDataColor brightness adjustment.
+
+    Negative percent = darken (shade), positive = lighten (tint).
+    PBI uses roughly linear interpolation toward black or white.
+    """
+    r, g, b = _hex_to_rgb(hex_color)
+    if percent > 0:
+        r = int(r + (255 - r) * percent)
+        g = int(g + (255 - g) * percent)
+        b = int(b + (255 - b) * percent)
+    elif percent < 0:
+        factor = 1 + percent
+        r = int(r * factor)
+        g = int(g * factor)
+        b = int(b * factor)
+    return _rgb_to_hex(
+        max(0, min(255, r)),
+        max(0, min(255, g)),
+        max(0, min(255, b)),
+    )
+
+
+def _resolve_pbi_color_expr(color_expr: dict, data_colors: list[str]) -> Optional[str]:
+    """Resolve a PBI color expression to a hex string.
+
+    Handles:
+    - Literal hex values: {"Literal": {"Value": "'#FF0000'"}}
+    - Theme data color refs: {"ThemeDataColor": {"ColorId": 0, "Percent": -0.1}}
+    - Direct solid hex: plain string like "#FF0000"
+    """
+    if isinstance(color_expr, str):
+        if color_expr.startswith("#"):
+            return color_expr.upper()
+        return None
+
+    if "expr" in color_expr:
+        return _resolve_pbi_color_expr(color_expr["expr"], data_colors)
+
+    if "Literal" in color_expr:
+        val = color_expr["Literal"].get("Value", "")
+        val = val.strip("'\"")
+        if val.startswith("#") and len(val) in (4, 7):
+            return val.upper()
+        return None
+
+    if "ThemeDataColor" in color_expr:
+        tdc = color_expr["ThemeDataColor"]
+        color_id = tdc.get("ColorId", 0)
+        percent = tdc.get("Percent", 0)
+        if color_id < len(data_colors):
+            base = data_colors[color_id]
+            if percent == 0:
+                return base.upper()
+            return _adjust_color_brightness(base, percent).upper()
+        return None
+
+    return None
+
+
+def extract_pbi_theme_colors(report_dir: str) -> PbiColorPalette:
+    """Extract the color palette from the PBI report's base theme.
+
+    Reads report.json to find the theme reference, then loads the
+    BaseThemes/*.json file to extract the dataColors palette and
+    semantic colors (good, bad, neutral, etc.).
+    """
+    palette = PbiColorPalette()
+
+    report_json_path = os.path.join(report_dir, "definition", "report.json")
+    if not os.path.isfile(report_json_path):
+        return palette
+
+    with open(report_json_path, "r") as f:
+        report_data = json.load(f)
+
+    theme_path = None
+    for rp in report_data.get("resourcePackages", []):
+        for item in rp.get("items", []):
+            if item.get("type") == "BaseTheme":
+                rel_path = item.get("path", "")
+                if rel_path:
+                    theme_path = os.path.join(
+                        report_dir, "StaticResources",
+                        rp.get("name", "SharedResources"),
+                        rel_path,
+                    )
+                    break
+        if theme_path:
+            break
+
+    if not theme_path:
+        candidates = glob.glob(
+            os.path.join(report_dir, "StaticResources", "**", "BaseThemes", "*.json"),
+            recursive=True,
+        )
+        if candidates:
+            theme_path = candidates[0]
+
+    if not theme_path or not os.path.isfile(theme_path):
+        return palette
+
+    with open(theme_path, "r") as f:
+        theme_data = json.load(f)
+
+    palette.data_colors = [
+        c.upper() if isinstance(c, str) else c
+        for c in theme_data.get("dataColors", [])
+    ]
+
+    for key in ("good", "bad", "neutral", "tableAccent", "maximum", "center", "minimum"):
+        val = theme_data.get(key)
+        if isinstance(val, str) and val.startswith("#"):
+            palette.semantic_colors[key] = val.upper()
+
+    return palette
+
+
+def extract_visual_colors(
+    visual_json: dict,
+    data_colors: list[str],
+) -> list[dict]:
+    """Extract per-data-point or per-series color assignments from a visual.
+
+    Returns a list of dicts like:
+        [{"hex": "#118DFF", "category": "Coffee"}, {"hex": "#12239E"}]
+
+    Handles objects.dataPoint with fill colors (literal or ThemeDataColor).
+    """
+    vis = visual_json.get("visual", {})
+    objects = vis.get("objects", {})
+    result: list[dict] = []
+
+    for dp in objects.get("dataPoint", []):
+        props = dp.get("properties", {})
+        fill = props.get("fill", {})
+        solid = fill.get("solid", {})
+        color_val = solid.get("color", {})
+        hex_color = _resolve_pbi_color_expr(color_val, data_colors)
+        if not hex_color:
+            continue
+
+        entry: dict = {"hex": hex_color}
+
+        selector = dp.get("selector", {})
+        scope_data = selector.get("data", [])
+        if scope_data:
+            for scope_item in scope_data:
+                if isinstance(scope_item, dict):
+                    scope_id = scope_item.get("scopeId", {})
+                    if isinstance(scope_id, dict):
+                        val = scope_id.get("Value", "")
+                        if val:
+                            entry["category"] = val.strip("'\"")
+        result.append(entry)
+
+    for fill_item in objects.get("fill", []):
+        props = fill_item.get("properties", {})
+        fill_color = props.get("fillColor", {})
+        solid = fill_color.get("solid", {})
+        color_val = solid.get("color", {})
+        hex_color = _resolve_pbi_color_expr(color_val, data_colors)
+        if hex_color:
+            result.append({"hex": hex_color})
+
+    return result
+
+
 def _slim_tmdl(content: str) -> str:
     """Strip non-essential metadata from a .tmdl file.
 
@@ -542,6 +741,7 @@ class PbiVisual:
     grid_y: int = 0
     grid_width: int = 1
     grid_height: int = 3
+    colors: list = field(default_factory=list)
 
 
 @dataclass
@@ -693,12 +893,16 @@ def _pixel_to_grid_width(pbi_width: float, grid_x: int, canvas_width: int = PBI_
     return max(1, w)
 
 
-def parse_pbi_layout(report_dir: str) -> PbiLayout:
+def parse_pbi_layout(
+    report_dir: str,
+    color_palette: Optional[PbiColorPalette] = None,
+) -> PbiLayout:
     """Parse PBI report into a structured layout with computed grid positions.
 
     Reads pages.json for ordering, each page.json for dimensions, and each
     visual.json for type and pixel position. Converts pixel positions to AIBI
     6-column grid coordinates and classifies visuals as data/slicer/decorative.
+    When a color_palette is provided, also extracts per-visual color assignments.
     """
     layout = PbiLayout()
     pages_dir = os.path.join(report_dir, "definition", "pages")
@@ -774,6 +978,10 @@ def parse_pbi_layout(report_dir: str) -> PbiLayout:
             is_slicer = vis_type in SLICER_TYPES
             slicer_field = _extract_slicer_field(vis_data) if is_slicer else None
 
+            vis_colors = []
+            if color_palette and color_palette.data_colors:
+                vis_colors = extract_visual_colors(vis_data, color_palette.data_colors)
+
             visual = PbiVisual(
                 visual_id=vis_id,
                 visual_type=vis_type,
@@ -785,6 +993,7 @@ def parse_pbi_layout(report_dir: str) -> PbiLayout:
                 is_slicer=is_slicer,
                 is_decorative=vis_type in DECORATIVE_TYPES,
                 slicer_field=slicer_field,
+                colors=vis_colors,
             )
 
             visual.grid_x = _pixel_to_grid_x(pbi_x, canvas_w)
@@ -956,6 +1165,63 @@ def _normalize_row_widths(row: list, stacked_xs: set[int] | None = None) -> None
         v.grid_x = running_x
         v.grid_width = w
         running_x += w
+
+
+def build_color_context(
+    color_palette: PbiColorPalette,
+    layout: PbiLayout,
+) -> str:
+    """Build a text section describing the PBI color palette for the LLM prompt.
+
+    Includes the theme's data colors (the chart palette used by all visuals)
+    and any per-visual explicit color assignments found in the report.
+    """
+    if not color_palette.data_colors:
+        return ""
+
+    lines = [
+        "## COLOR PALETTE — PRESERVE THESE COLORS",
+        "",
+        "The original Power BI report uses the following data color palette (in order):",
+        ", ".join(color_palette.data_colors[:12]),
+        "",
+        "**Rules for color preservation:**",
+        "- For any chart that uses a `color` encoding with `scale.type: \"categorical\"`, "
+        "add a `scale.range` array with colors from the palette above.",
+        "- Use the first N colors from the palette (in order) where N is the expected "
+        "number of distinct categories in that dimension.",
+        "- For pie charts: set `color.scale.range` to the palette colors.",
+        "- For bar/line charts with a color grouping dimension: set `color.scale.range`.",
+        "- For single-series charts (no color encoding): the dashboard theme handles colors.",
+        "",
+    ]
+
+    visuals_with_colors = []
+    for page in layout.pages:
+        for v in page.data_visuals:
+            if v.colors:
+                color_entries = []
+                for c in v.colors:
+                    if "category" in c:
+                        color_entries.append(f"{c['category']}={c['hex']}")
+                    else:
+                        color_entries.append(c["hex"])
+                visuals_with_colors.append(
+                    f"  - `{v.visual_type}` \"{v.display_name or v.visual_id[:12]}\": "
+                    + ", ".join(color_entries)
+                )
+
+    if visuals_with_colors:
+        lines.append("**Per-visual color assignments from the PBI report:**")
+        lines.extend(visuals_with_colors)
+        lines.append("")
+        lines.append(
+            "When you know the category-to-color mapping, use `scale.domain` (category values) "
+            "and `scale.range` (hex colors) together on the color encoding."
+        )
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def build_layout_blueprint_prompt(layout: PbiLayout) -> str:
@@ -1271,6 +1537,92 @@ def apply_blueprint_positions(dashboard_json: dict, pbi_layout: PbiLayout) -> di
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: apply PBI colors to generated dashboard
+# ---------------------------------------------------------------------------
+
+_CHART_WIDGET_TYPES = {"bar", "line", "pie", "area", "scatter"}
+
+
+def apply_pbi_colors(
+    dashboard_json: dict,
+    color_palette: PbiColorPalette,
+    pbi_layout: Optional[PbiLayout] = None,
+) -> dict:
+    """Inject PBI theme colors into the generated dashboard JSON.
+
+    Two strategies:
+    1. For charts with a categorical `color` encoding that lacks an explicit
+       `scale.range`, inject the PBI theme palette as the range so chart
+       series colors match the original report.
+    2. For visuals that had per-data-point color assignments in PBI, inject
+       `scale.domain` + `scale.range` mappings when the info is available.
+    """
+    if not color_palette.data_colors:
+        return dashboard_json
+
+    palette = color_palette.data_colors
+
+    # Build lookup: visual description → colors from PBI layout
+    per_visual_colors: dict[str, list[dict]] = {}
+    if pbi_layout:
+        for page in pbi_layout.pages:
+            for v in page.data_visuals:
+                if v.colors:
+                    key = (v.display_name or "").lower()
+                    per_visual_colors[key] = v.colors
+
+    for page in dashboard_json.get("pages", []):
+        for item in page.get("layout", []):
+            widget = item.get("widget", {})
+            spec = widget.get("spec", {})
+            if not isinstance(spec, dict):
+                continue
+
+            widget_type = spec.get("widgetType", "")
+            if widget_type not in _CHART_WIDGET_TYPES:
+                continue
+
+            encodings = spec.get("encodings", {})
+            if not isinstance(encodings, dict):
+                continue
+
+            color_enc = encodings.get("color")
+            if not isinstance(color_enc, dict):
+                continue
+
+            scale = color_enc.get("scale", {})
+            if not isinstance(scale, dict):
+                continue
+
+            if scale.get("type") != "categorical":
+                continue
+
+            if "range" in scale:
+                continue
+
+            # Check if this visual has specific PBI color assignments
+            widget_title = spec.get("frame", {}).get("title", "").lower()
+            matched_vis_colors = per_visual_colors.get(widget_title)
+
+            if matched_vis_colors:
+                cats_with_colors = [
+                    c for c in matched_vis_colors if "category" in c
+                ]
+                if cats_with_colors:
+                    scale["domain"] = [c["category"] for c in cats_with_colors]
+                    scale["range"] = [c["hex"] for c in cats_with_colors]
+                else:
+                    explicit_colors = [c["hex"] for c in matched_vis_colors]
+                    scale["range"] = explicit_colors
+            else:
+                scale["range"] = palette[:12]
+
+            color_enc["scale"] = scale
+
+    return dashboard_json
+
+
+# ---------------------------------------------------------------------------
 # LLM Interaction
 # ---------------------------------------------------------------------------
 
@@ -1283,7 +1635,12 @@ def _estimate_tokens(text: str) -> int:
 MAX_PROMPT_TOKENS = 190_000
 
 
-def call_llm(report_name: str, pbi_context: str, layout_blueprint: str = "") -> str:
+def call_llm(
+    report_name: str,
+    pbi_context: str,
+    layout_blueprint: str = "",
+    color_context: str = "",
+) -> str:
     """Send the PBI context to the LLM and return the raw response text.
 
     If the assembled prompt exceeds the model's context window, raises a
@@ -1293,17 +1650,18 @@ def call_llm(report_name: str, pbi_context: str, layout_blueprint: str = "") -> 
 
     blueprint_section = ""
     if layout_blueprint:
-        blueprint_section = f"""
+        blueprint_section = f"\n\n{layout_blueprint}\n"
 
-{layout_blueprint}
-"""
+    color_section = ""
+    if color_context:
+        color_section = f"\n\n{color_context}\n"
 
     user_message = f"""Convert this Power BI report named "{report_name}" to a Databricks AI/BI dashboard (.lvdash.json).
 
 ## Power BI Report Contents
 
 {pbi_context}
-{blueprint_section}
+{blueprint_section}{color_section}
 ## Instructions
 
 1. Extract the data source catalog/schema/table from the .tmdl partition blocks
@@ -1314,6 +1672,7 @@ def call_llm(report_name: str, pbi_context: str, layout_blueprint: str = "") -> 
 6. Use proper 6-column grid layout with no gaps
 7. Ensure all field names in query.fields match fieldNames in encodings exactly
 8. **CRITICAL: Follow the LAYOUT BLUEPRINT above exactly — same number of pages, same visuals, same approximate positions**
+9. **Preserve the PBI color palette** — for charts with categorical color encodings, use `scale.range` with the PBI theme colors
 
 Return ONLY the JSON — no markdown fences, no explanation."""
 
@@ -1362,6 +1721,7 @@ def call_llm_chunked(
     semantic_model_ctx: str,
     page_chunks: list[tuple[str, str]],
     layout_blueprint: str = "",
+    color_context: str = "",
     progress_callback=None,
 ) -> str:
     """Convert a large PBI report using multi-turn chat, sending pages in batches.
@@ -1380,7 +1740,11 @@ def call_llm_chunked(
     if layout_blueprint:
         blueprint_section = f"\n\n{layout_blueprint}\n"
 
-    base_tokens = system_tokens + _estimate_tokens(semantic_model_ctx) + _estimate_tokens(blueprint_section)
+    color_section = ""
+    if color_context:
+        color_section = f"\n\n{color_context}\n"
+
+    base_tokens = system_tokens + _estimate_tokens(semantic_model_ctx) + _estimate_tokens(blueprint_section) + _estimate_tokens(color_section)
 
     # Group pages into batches that fit within the token budget
     batches: list[list[tuple[str, str]]] = []
@@ -1417,7 +1781,7 @@ def call_llm_chunked(
                 f"This is batch 1/{len(batches)} containing pages: {', '.join(batch_page_names)}.\n\n"
                 f"## Semantic Model\n\n{semantic_model_ctx}\n\n"
                 f"## Pages (batch 1/{len(batches)})\n\n{batch_pages_ctx}"
-                f"{blueprint_section}\n"
+                f"{blueprint_section}{color_section}\n"
                 f"## Instructions\n\n"
                 f"1. Extract the data source catalog/schema/table from the .tmdl partition blocks\n"
                 f"2. Build SQL dataset(s) with JOINs and fully-qualified names. Simple aggregations (SUM/COUNT/AVG on a column) are fine — they'll be auto-promoted to custom calculations. Complex expressions (CASE WHEN, NULLIF, arithmetic) stay in dataset SQL.\n"
@@ -1426,6 +1790,7 @@ def call_llm_chunked(
                 f"5. Skip decorative shapes\n"
                 f"6. Use proper 6-column grid layout with no gaps\n"
                 f"7. Ensure all field names in query.fields match fieldNames in encodings exactly\n"
+                f"8. Preserve the PBI color palette in charts with categorical color encodings using scale.range\n"
             )
             if len(batches) > 1:
                 user_msg += (

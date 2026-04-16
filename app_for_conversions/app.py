@@ -17,6 +17,7 @@ from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.dashboards import Dashboard
 
 from clients import MODEL, STATIC_DIR, VALID_WIDGET_VERSIONS
+from export_pdf import build_export_pdf
 from converter import (
     extract_upload,
     find_pbi_folders,
@@ -24,15 +25,15 @@ from converter import (
     collect_pbi_context_chunked,
     extract_pbi_source_tables,
     detect_external_sources,
+    extract_pbi_theme_colors,
+    build_color_context,
     parse_pbi_layout,
-    build_layout_blueprint_prompt,
     build_free_layout_blueprint_prompt,
-    should_use_free_layout,
     call_llm,
     call_llm_chunked,
     generate_explanation,
     extract_json_from_response,
-    apply_blueprint_positions,
+    apply_pbi_colors,
     _ensure_fqn_tables,
     fix_dataset_columns,
     _estimate_tokens,
@@ -82,17 +83,6 @@ uploaded_file = st.file_uploader(
     "Upload .pbip project (zip file)",
     type=["zip"],
     help="Zip containing the .pbip file, .Report/ folder, and .SemanticModel/ folder.",
-)
-
-layout_mode = st.radio(
-    "Layout mode",
-    options=["Auto", "Strict", "Free"],
-    horizontal=True,
-    captions=[
-        "The converter will decide the best layout for the report (Strict for simple reports, Free for dense ones)",
-        "The converter will keep the positions from the original PBI report (may not be optimal for grouped visuals and custom visuals, deterministic conversion)",
-        "LLM decides the best layout for the report (better aesthetics, non-deterministic conversion)"
-    ],
 )
 
 convert_clicked = st.button("Convert & Publish", type="primary", use_container_width=True)
@@ -154,8 +144,17 @@ if convert_clicked:
             unique_types = sorted({s["source_type"] for s in external_sources})
             progress.write(f"⚠️ **{len(external_sources)} table(s) from external sources:** {', '.join(unique_types)}")
 
+        progress.write("🎨 Extracting PBI theme colors...")
+        color_palette = extract_pbi_theme_colors(report_dir)
+        if color_palette.data_colors:
+            n_colors = len(color_palette.data_colors)
+            preview = ", ".join(color_palette.data_colors[:6])
+            progress.write(f"Found **{n_colors} theme colors**: {preview}{'…' if n_colors > 6 else ''}")
+        else:
+            progress.write("No theme colors found — using default AI/BI palette")
+
         progress.write("📐 Parsing PBI layout structure...")
-        pbi_layout = parse_pbi_layout(report_dir)
+        pbi_layout = parse_pbi_layout(report_dir, color_palette=color_palette)
         progress.write(
             f"Found **{pbi_layout.total_canvas_pages} page(s)**, "
             f"**{pbi_layout.total_data_visuals} data visual(s)**, "
@@ -167,22 +166,13 @@ if convert_clicked:
             slicer_info = f", {len(pg.page_slicers)} page filter(s)" if pg.page_slicers else ""
             progress.write(f"  Page \"{pg.display_name}\": {', '.join(vis_types) or '(empty)'}{slicer_info}")
 
-        if layout_mode == "Auto":
-            free_layout = should_use_free_layout(pbi_layout)
-        else:
-            free_layout = layout_mode == "Free"
+        layout_blueprint = build_free_layout_blueprint_prompt(pbi_layout)
+        progress.write("🎨 Using **free layout mode** (LLM decides positioning)")
 
-        if free_layout:
-            layout_blueprint = build_free_layout_blueprint_prompt(pbi_layout)
-            reason = "selected by user" if layout_mode == "Free" else "dense report detected"
-            progress.write(f"🎨 Using **free layout mode** ({reason} — LLM decides positioning)")
-        else:
-            layout_blueprint = build_layout_blueprint_prompt(pbi_layout)
-            if layout_mode == "Strict":
-                progress.write("📐 Using **strict layout mode** (selected by user — positions from PBI coordinates)")
+        color_context = build_color_context(color_palette, pbi_layout)
 
         # --- Phase 2: LLM Conversion ---
-        est_tokens = _estimate_tokens(pbi_context + layout_blueprint)
+        est_tokens = _estimate_tokens(pbi_context + layout_blueprint + color_context)
         progress.write(f"📏 Estimated context size: **~{est_tokens:,} tokens** (after compression)")
 
         use_chunked = est_tokens > MAX_PROMPT_TOKENS
@@ -198,21 +188,21 @@ if convert_clicked:
                 semantic_ctx,
                 page_chunks,
                 layout_blueprint,
+                color_context=color_context,
                 progress_callback=lambda msg: progress.write(f"  🔄 {msg}"),
             )
         else:
-            mode_label = "free layout" if free_layout else "layout blueprint"
             progress.write(f"🤖 Sending to **{MODEL}** for conversion...")
-            raw_response = call_llm(report_name, pbi_context, layout_blueprint)
+            raw_response = call_llm(report_name, pbi_context, layout_blueprint, color_context=color_context)
 
         progress.write("Received LLM response")
 
         progress.write("🔧 Parsing dashboard JSON...")
         dashboard_json = extract_json_from_response(raw_response)
 
-        if not free_layout:
-            progress.write("📐 Enforcing blueprint positions...")
-            dashboard_json = apply_blueprint_positions(dashboard_json, pbi_layout)
+        if color_palette.data_colors:
+            progress.write("🎨 Applying PBI color palette to chart widgets...")
+            dashboard_json = apply_pbi_colors(dashboard_json, color_palette, pbi_layout)
 
         n_datasets = len(dashboard_json.get("datasets", []))
         n_pages = len(dashboard_json.get("pages", []))
@@ -365,6 +355,29 @@ if convert_clicked:
         st.markdown(f"**Model:** `{MODEL}`")
         st.markdown(f"**Workspace path:** `{workspace_path}`")
         st.markdown(f"**[Open Dashboard]({dash_url})**")
+
+        try:
+            pdf_bytes = build_export_pdf(
+                report_name=report_name,
+                model=MODEL,
+                workspace_path=workspace_path,
+                dash_url=dash_url,
+                n_datasets=n_datasets,
+                n_widgets=n_widgets,
+                n_canvas=n_canvas,
+                n_pages=n_pages,
+                layout_fidelity=layout_fidelity,
+                explanation=explanation,
+                validation=validation,
+                data_sources=data_sources,
+                external_sources=external_sources,
+                dashboard_json=dashboard_json,
+                valid_widget_versions=VALID_WIDGET_VERSIONS,
+            )
+            st.session_state["pdf_bytes"] = pdf_bytes
+            st.session_state["pdf_filename"] = f"{report_name}_validation_report.pdf"
+        except Exception as pdf_err:
+            st.warning(f"PDF export unavailable: {pdf_err}")
 
         # Conversion explanation (shown first)
         with st.expander("Conversion Report", expanded=False):
@@ -587,3 +600,19 @@ if convert_clicked:
         st.error(f"Conversion failed: {e}")
         with st.expander("Full traceback"):
             st.code(traceback.format_exc(), language="text")
+
+# ---------------------------------------------------------------------------
+# Persistent PDF download (fragment avoids full-page rerun on click)
+# ---------------------------------------------------------------------------
+
+@st.fragment
+def _pdf_download():
+    if "pdf_bytes" in st.session_state:
+        st.download_button(
+            ":material/download: Export Validation Report (PDF)",
+            data=st.session_state["pdf_bytes"],
+            file_name=st.session_state.get("pdf_filename", "validation_report.pdf"),
+            mime="application/pdf",
+        )
+
+_pdf_download()
