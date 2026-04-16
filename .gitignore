@@ -24,5 +24,9 @@ node_modules/
 .databricks-resources.json
 .databricks/
 
+# AI Dev Kit local install
+.ai-dev-kit/
+repo/
+
 # macOS
 .DS_Store
