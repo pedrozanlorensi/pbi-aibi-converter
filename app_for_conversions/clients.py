@@ -2,14 +2,13 @@
 Shared configuration constants and client factories for the PBI-to-AIBI converter.
 
 Provides authenticated clients for:
-  - Databricks workspace operations (via service principal or forwarded user token)
+  - Databricks workspace operations (via service principal in the app environment)
   - LLM inference via Databricks Model Serving (OpenAI-compatible)
 """
 
 import os
 from pathlib import Path
 
-import streamlit as st
 from openai import OpenAI
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.core import Config
@@ -35,24 +34,13 @@ VALID_WIDGET_VERSIONS = {
 
 
 def get_workspace_client() -> WorkspaceClient:
-    """Return a WorkspaceClient authenticated as the current user.
+    """Return a WorkspaceClient.
 
-    In a Databricks App the proxy injects an X-Forwarded-Access-Token header
-    with the user's OAuth token. We temporarily hide the SP env vars so the
-    SDK doesn't raise "more than one authorization method configured".
+    Inside a Databricks App, this picks up the app's service principal
+    automatically from injected env vars. Locally it falls back to
+    whatever the default Databricks SDK auth chain resolves to (PAT,
+    profile, etc.).
     """
-    headers = st.context.headers
-    token = headers.get("X-Forwarded-Access-Token")
-    if token:
-        host = os.getenv("DATABRICKS_HOST", Config().host)
-        saved = {}
-        for key in ("DATABRICKS_CLIENT_ID", "DATABRICKS_CLIENT_SECRET"):
-            if key in os.environ:
-                saved[key] = os.environ.pop(key)
-        try:
-            return WorkspaceClient(host=host, token=token)
-        finally:
-            os.environ.update(saved)
     return WorkspaceClient()
 
 
