@@ -16,7 +16,7 @@ import zipfile
 import tempfile
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Optional
+from typing import Any, Optional
 
 from clients import MODEL, KNOWLEDGE_DIR, GRID_COLUMNS, get_llm_client
 
@@ -33,19 +33,23 @@ def _load_knowledge_file(filename: str) -> str:
 def build_system_prompt() -> str:
     """Assemble the LLM system prompt from knowledge documents.
 
-    Loads CONVERSION_GUIDE.md (PBI-to-AIBI mapping rules) and
-    AIBI_DASHBOARD_SKILL.md (full .lvdash.json spec) so the LLM has
-    comprehensive reference material for the conversion.
+    Loads CONVERSION_GUIDE.md (PBI-to-AIBI mapping rules),
+    AIBI_DASHBOARD_SKILL.md (full .lvdash.json spec),
+    DAX_TO_SQL_GUIDE.md (DAX translation patterns), and
+    VISUAL_ALTERNATIVES_GUIDE.md (fallbacks for unsupported PBI visual
+    types — maps, gauges, decomposition trees, custom visuals, etc.)
+    so the LLM has comprehensive reference material for the conversion.
     """
     conversion_guide = _load_knowledge_file("CONVERSION_GUIDE.md")
     aibi_skill = _load_knowledge_file("AIBI_DASHBOARD_SKILL.md")
     dax_guide = _load_knowledge_file("DAX_TO_SQL_GUIDE.md")
+    alternatives_guide = _load_knowledge_file("VISUAL_ALTERNATIVES_GUIDE.md")
 
     return f"""You are an expert at converting Power BI reports to Databricks AI/BI dashboards.
 
 You will receive the full contents of a Power BI project (.pbip): table definitions (.tmdl), relationships, and visual definitions (visual.json). Your job is to produce a valid .lvdash.json dashboard definition.
 
-Below are three comprehensive reference documents you MUST follow exactly. They contain the conversion rules, widget specifications, layout guidelines, DAX translation patterns, and common pitfalls.
+Below are four comprehensive reference documents you MUST follow exactly. They contain the conversion rules, widget specifications, layout guidelines, DAX translation patterns, fallback strategies for unsupported PBI visual types, and common pitfalls.
 
 ---
 
@@ -64,6 +68,14 @@ Below are three comprehensive reference documents you MUST follow exactly. They 
 # REFERENCE 3: DAX TO SQL TRANSLATION GUIDE
 
 {dax_guide}
+
+---
+
+# REFERENCE 4: VISUAL ALTERNATIVES GUIDE (fallbacks for unmapped PBI visuals)
+
+When a PBI visual has no direct AI/BI equivalent (maps, gauges, decomposition trees, ribbon/funnel/waterfall/treemap charts, custom visuals, KPIs with sparklines, R/Python visuals, etc.), follow the fallback patterns below to emit the best available widget(s) instead of skipping the visual or producing an empty placeholder.
+
+{alternatives_guide}
 
 ---
 
@@ -99,14 +111,30 @@ def _get_system_prompt() -> str:
 
 
 def extract_upload(uploaded_file) -> str:
-    """Save the uploaded file to a temp directory and extract if it's a zip."""
+    """Save the uploaded file to a temp directory and extract.
+
+    Supports two upload formats:
+      - .zip containing a .pbip project (.pbip file, .Report/, .SemanticModel/)
+      - .pbit (a single zipped Power BI template containing DataModelSchema + Report/)
+
+    For .pbit uploads, the DataModelSchema (TMSL JSON in UTF-16 LE) is decoded
+    and converted into the equivalent .SemanticModel/definition/*.tmdl tree so
+    the rest of the pipeline can treat .pbit and .pbip identically.
+    """
     tmpdir = tempfile.mkdtemp(prefix="pbi_upload_")
     file_path = os.path.join(tmpdir, uploaded_file.name)
     with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
-    if file_path.endswith(".zip"):
+
+    lower = file_path.lower()
+    if lower.endswith(".zip") or lower.endswith(".pbit"):
         with zipfile.ZipFile(file_path, "r") as zf:
             zf.extractall(tmpdir)
+
+    if lower.endswith(".pbit"):
+        base_name = os.path.splitext(os.path.basename(uploaded_file.name))[0]
+        _synthesize_pbip_from_pbit(tmpdir, base_name)
+
     return tmpdir
 
 
@@ -120,6 +148,279 @@ def find_report_root(base_dir: str) -> str:
             if d.endswith(".Report"):
                 return root
     return base_dir
+
+
+# ---------------------------------------------------------------------------
+# .pbit (Power BI Template) Support
+# ---------------------------------------------------------------------------
+
+def _decode_pbi_text_file(path: str) -> str:
+    """Decode a Power BI text file.
+
+    .pbit files store DataModelSchema/Metadata/Settings as UTF-16 LE (no BOM)
+    JSON. Other files (Report/**.json) are plain UTF-8. Tries UTF-16 first
+    and falls back to UTF-8.
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    # UTF-16 LE files written by Power BI start with the JSON `{` byte (0x7B)
+    # followed by 0x00. Use that to detect UTF-16 LE vs UTF-8.
+    if len(raw) >= 2 and raw[1] == 0x00:
+        for encoding in ("utf-16-le", "utf-16"):
+            try:
+                return raw.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+    for encoding in ("utf-8-sig", "utf-8"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _needs_tmdl_quotes(name: str) -> bool:
+    """TMDL identifiers need single quotes if they contain non-ident chars."""
+    import re
+    return bool(re.search(r"[^A-Za-z0-9_]", name)) if name else False
+
+
+def _tmdl_ident(name: str) -> str:
+    """Quote a TMDL identifier if needed."""
+    if not name:
+        return "''"
+    if _needs_tmdl_quotes(name):
+        return f"'{name}'"
+    return name
+
+
+def _normalize_expression(expr) -> str:
+    """TMSL `expression` can be a string or list-of-strings. Join lists with newline."""
+    if isinstance(expr, list):
+        return "\n".join(str(e) for e in expr)
+    return str(expr) if expr is not None else ""
+
+
+def _tmsl_column_to_tmdl(col: dict) -> list[str]:
+    """Convert a TMSL column dict to TMDL lines."""
+    lines: list[str] = []
+    col_name = col.get("name", "")
+    decl = f"\tcolumn {_tmdl_ident(col_name)}"
+    if col.get("type") == "calculated":
+        expr = _normalize_expression(col.get("expression", ""))
+        if expr:
+            decl += f" = {expr.splitlines()[0] if expr else ''}"
+    lines.append(decl)
+    if col.get("dataType"):
+        lines.append(f"\t\tdataType: {col['dataType']}")
+    if col.get("sourceColumn"):
+        lines.append(f"\t\tsourceColumn: {col['sourceColumn']}")
+    if col.get("formatString"):
+        lines.append(f"\t\tformatString: {col['formatString']}")
+    if col.get("dataCategory"):
+        lines.append(f"\t\tdataCategory: {col['dataCategory']}")
+    if col.get("isHidden"):
+        lines.append("\t\tisHidden")
+    lines.append("")
+    return lines
+
+
+def _tmsl_measure_to_tmdl(measure: dict) -> list[str]:
+    """Convert a TMSL measure dict to TMDL lines."""
+    lines: list[str] = []
+    m_name = measure.get("name", "")
+    expr = _normalize_expression(measure.get("expression", ""))
+    decl = f"\tmeasure {_tmdl_ident(m_name)}"
+    if expr:
+        if "\n" in expr:
+            decl += " ="
+            lines.append(decl)
+            for ln in expr.splitlines():
+                lines.append(f"\t\t{ln}")
+        else:
+            decl += f" = {expr}"
+            lines.append(decl)
+    else:
+        lines.append(decl)
+    if measure.get("formatString"):
+        lines.append(f"\t\tformatString: {measure['formatString']}")
+    if measure.get("displayFolder"):
+        lines.append(f"\t\tdisplayFolder: {measure['displayFolder']}")
+    lines.append("")
+    return lines
+
+
+def _tmsl_partition_to_tmdl(partition: dict, table_name: str) -> list[str]:
+    """Convert a TMSL partition dict to TMDL lines, preserving the M expression
+    verbatim so the existing connector/source-table regexes still match."""
+    lines: list[str] = []
+    p_name = partition.get("name", table_name)
+    source = partition.get("source", {}) or {}
+    src_type = source.get("type", "m")
+    expr = _normalize_expression(source.get("expression", ""))
+
+    if src_type == "calculated":
+        if expr:
+            lines.append(f"\tpartition {_tmdl_ident(p_name)} = calculated")
+            lines.append("\t\tsource =")
+            for ln in expr.splitlines() or [""]:
+                lines.append(f"\t\t\t{ln}")
+        else:
+            lines.append(f"\tpartition {_tmdl_ident(p_name)} = calculated")
+    else:
+        lines.append(f"\tpartition {_tmdl_ident(p_name)} = m")
+        mode = partition.get("mode") or "import"
+        lines.append(f"\t\tmode: {mode}")
+        lines.append("\t\tsource =")
+        for ln in expr.splitlines() or [""]:
+            lines.append(f"\t\t\t{ln}")
+    lines.append("")
+    return lines
+
+
+def _tmsl_table_to_tmdl(table: dict) -> str:
+    """Render a single TMSL table as a .tmdl-formatted text block."""
+    name = table.get("name", "Unknown")
+    out: list[str] = [f"table {_tmdl_ident(name)}", ""]
+
+    for col in table.get("columns", []) or []:
+        out.extend(_tmsl_column_to_tmdl(col))
+
+    for meas in table.get("measures", []) or []:
+        out.extend(_tmsl_measure_to_tmdl(meas))
+
+    for part in table.get("partitions", []) or []:
+        out.extend(_tmsl_partition_to_tmdl(part, name))
+
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _tmsl_relationships_to_tmdl(relationships: list[dict]) -> str:
+    """Render TMSL relationships[] as a relationships.tmdl text block."""
+    if not relationships:
+        return ""
+    out: list[str] = []
+    for rel in relationships:
+        rel_name = rel.get("name", "")
+        out.append(f"relationship {_tmdl_ident(rel_name) if rel_name else 'rel'}")
+        from_tbl = rel.get("fromTable", "")
+        from_col = rel.get("fromColumn", "")
+        to_tbl = rel.get("toTable", "")
+        to_col = rel.get("toColumn", "")
+        if from_tbl and from_col:
+            out.append(f"\tfromColumn: {_tmdl_ident(from_tbl)}.{_tmdl_ident(from_col)}")
+        if to_tbl and to_col:
+            out.append(f"\ttoColumn: {_tmdl_ident(to_tbl)}.{_tmdl_ident(to_col)}")
+        for key in (
+            "crossFilteringBehavior", "joinOnDateBehavior",
+            "isActive", "securityFilteringBehavior",
+            "fromCardinality", "toCardinality",
+        ):
+            if key in rel:
+                out.append(f"\t{key}: {rel[key]}")
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _tmsl_model_to_tmdl(model: dict) -> str:
+    """Render top-level TMSL model metadata as a model.tmdl text block."""
+    out: list[str] = ["model Model", ""]
+    for key in ("culture", "sourceQueryCulture", "defaultPowerBIDataSourceVersion"):
+        if key in model:
+            out.append(f"\t{key}: {model[key]}")
+    for expr in model.get("expressions", []) or []:
+        ex_name = expr.get("name", "expr")
+        ex_body = _normalize_expression(expr.get("expression", ""))
+        out.append("")
+        out.append(f"\texpression {_tmdl_ident(ex_name)} =")
+        for ln in ex_body.splitlines() or [""]:
+            out.append(f"\t\t{ln}")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def _synthesize_pbip_from_pbit(tmpdir: str, base_name: str) -> None:
+    """Convert an extracted .pbit layout into the .pbip layout expected
+    by the rest of the converter.
+
+    Steps:
+      1. Locate the extracted `Report/` folder (or any nested equivalent).
+      2. Rename it to `<base_name>.Report/`.
+      3. Read `DataModelSchema` (UTF-16 LE TMSL JSON) and write per-table
+         .tmdl files + relationships.tmdl + model.tmdl into
+         `<base_name>.SemanticModel/definition/`.
+
+    Idempotent and a no-op if the synthesized layout already exists.
+    """
+    if not base_name:
+        base_name = "pbit_model"
+
+    # Strip filesystem-unfriendly chars from the base name to avoid issues
+    # with the downstream .Report / .SemanticModel folder naming convention.
+    safe_base = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in base_name)
+    if not safe_base:
+        safe_base = "pbit_model"
+
+    # Locate the Report/ folder. It usually sits at tmpdir root after the
+    # unzip, but handle nested locations defensively.
+    report_src = None
+    schema_src = None
+    for root, dirs, files in os.walk(tmpdir):
+        for d in list(dirs):
+            if d == "Report" and not d.endswith(".Report"):
+                candidate = os.path.join(root, d)
+                if os.path.isdir(os.path.join(candidate, "definition", "pages")):
+                    report_src = candidate
+                    break
+        for f in files:
+            if f == "DataModelSchema" and schema_src is None:
+                schema_src = os.path.join(root, f)
+        if report_src:
+            break
+
+    if not report_src or not schema_src:
+        return  # Not a .pbit layout we can handle; let the caller error out.
+
+    parent = os.path.dirname(report_src)
+    target_report_dir = os.path.join(parent, f"{safe_base}.Report")
+    target_model_dir = os.path.join(parent, f"{safe_base}.SemanticModel")
+
+    if not os.path.exists(target_report_dir):
+        os.rename(report_src, target_report_dir)
+
+    if os.path.isdir(target_model_dir):
+        return  # Already synthesized
+
+    raw_text = _decode_pbi_text_file(schema_src)
+    try:
+        tmsl = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return
+
+    model = tmsl.get("model", {}) or {}
+    tables = model.get("tables", []) or []
+    relationships = model.get("relationships", []) or []
+
+    tables_out_dir = os.path.join(target_model_dir, "definition", "tables")
+    os.makedirs(tables_out_dir, exist_ok=True)
+
+    for table in tables:
+        table_name = table.get("name", "Unknown")
+        safe_table = "".join(c if c.isalnum() or c in ("_", "-", " ") else "_" for c in table_name)
+        out_path = os.path.join(tables_out_dir, f"{safe_table}.tmdl")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(_tmsl_table_to_tmdl(table))
+
+    rel_text = _tmsl_relationships_to_tmdl(relationships)
+    if rel_text:
+        rel_path = os.path.join(target_model_dir, "definition", "relationships.tmdl")
+        with open(rel_path, "w", encoding="utf-8") as f:
+            f.write(rel_text)
+
+    model_text = _tmsl_model_to_tmdl(model)
+    if model_text:
+        model_path = os.path.join(target_model_dir, "definition", "model.tmdl")
+        with open(model_path, "w", encoding="utf-8") as f:
+            f.write(model_text)
 
 
 def find_pbi_folders(tmpdir: str):
@@ -1543,81 +1844,211 @@ def apply_blueprint_positions(dashboard_json: dict, pbi_layout: PbiLayout) -> di
 _CHART_WIDGET_TYPES = {"bar", "line", "pie", "area", "scatter"}
 
 
-def apply_pbi_colors(
+def apply_brand_colors(
     dashboard_json: dict,
-    color_palette: PbiColorPalette,
-    pbi_layout: Optional[PbiLayout] = None,
+    pbi_layout: PbiLayout,
+    warehouse_id: str | None = None,
+    sp_client: Any = None,
+    free_layout: bool = False,
 ) -> dict:
-    """Inject PBI theme colors into the generated dashboard JSON.
+    """Inject the report author's brand hex colors into chart widgets.
 
-    Two strategies:
-    1. For charts with a categorical `color` encoding that lacks an explicit
-       `scale.range`, inject the PBI theme palette as the range so chart
-       series colors match the original report.
-    2. For visuals that had per-data-point color assignments in PBI, inject
-       `scale.domain` + `scale.range` mappings when the info is available.
+    Ported from the `color-pbi-cursor` flow and adapted to this codebase's
+    ``visual.colors`` schema (``list[dict]`` with ``"hex"`` and optional
+    ``"category"``).
+
+    Matching strategy
+    -----------------
+    1. In strict layout mode, widgets are matched to PBI visuals by
+       ``(grid_x, grid_y)``.
+    2. In free layout mode (the LLM picks its own positions), chart widgets
+       are matched to colored PBI visuals by **page order**.
+    3. If neither matches, a per-page queue of (AIBI-widget-type-set, colors)
+       lets us still attach colors when the LLM picked a different position
+       but kept the same chart shape.
+
+    Color application
+    -----------------
+    * If the PBI visual already provides a category→color map (each entry in
+      ``visual.colors`` has a ``"category"`` key), it is written directly
+      into ``encodings.color.scale.mappings`` — no warehouse query needed.
+    * Otherwise the warehouse is queried for the distinct values of the
+      categorical field and assigned colors round-robin from the visual's
+      ordered palette, also written to ``scale.mappings``.
+    * For categorical bar/area/line charts without a color encoding, the
+      colors are written to ``mark.colors`` (plural). For quantitative
+      encodings, the first color goes to ``mark.color`` (singular). These
+      are the AI/BI renderer's actual inputs — ``scale.range`` alone is
+      silently ignored for several chart types.
     """
-    if not color_palette.data_colors:
+    CHART_TYPES = {"bar", "line", "pie", "area", "scatter"}
+
+    def _hex_list(visual_colors: list[dict]) -> list[str]:
+        out: list[str] = []
+        for c in visual_colors or []:
+            hx = c.get("hex") if isinstance(c, dict) else None
+            if isinstance(hx, str) and hx.startswith("#"):
+                out.append(hx)
+        return out
+
+    def _category_map(visual_colors: list[dict]) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for c in visual_colors or []:
+            if not isinstance(c, dict):
+                continue
+            cat, hx = c.get("category"), c.get("hex")
+            if isinstance(cat, str) and cat and isinstance(hx, str) and hx.startswith("#"):
+                out[cat] = hx
+        return out
+
+    color_lookup: dict[tuple[int, int], list[str]] = {}
+    cat_lookup: dict[tuple[int, int], dict[str, str]] = {}
+    page_type_queues: dict[str, list[tuple[set[str], list[str], dict[str, str]]]] = {}
+    page_color_lists: dict[str, list[tuple[list[str], dict[str, str]]]] = {}
+
+    for pbi_page in pbi_layout.pages:
+        page_pairs: list[tuple[list[str], dict[str, str]]] = []
+        queue: list[tuple[set[str], list[str], dict[str, str]]] = []
+        for visual in pbi_page.visuals:
+            hexes = _hex_list(visual.colors)
+            if not hexes:
+                continue
+            cmap = _category_map(visual.colors)
+            color_lookup[(visual.grid_x, visual.grid_y)] = hexes
+            cat_lookup[(visual.grid_x, visual.grid_y)] = cmap
+            aibi_types = PBI_TO_AIBI_TYPE_MAP.get(visual.visual_type, set())
+            queue.append((set(aibi_types) & CHART_TYPES, hexes, cmap))
+            if not visual.is_slicer and not visual.is_decorative:
+                page_pairs.append((hexes, cmap))
+        if page_pairs:
+            page_color_lists[pbi_page.display_name] = page_pairs
+        if queue:
+            page_type_queues[pbi_page.display_name] = queue
+
+    if not color_lookup:
         return dashboard_json
 
-    palette = color_palette.data_colors
-
-    # Build lookup: visual description → colors from PBI layout
-    per_visual_colors: dict[str, list[dict]] = {}
-    if pbi_layout:
-        for page in pbi_layout.pages:
-            for v in page.data_visuals:
-                if v.colors:
-                    key = (v.display_name or "").lower()
-                    per_visual_colors[key] = v.colors
+    dataset_sql: dict[str, str] = {}
+    for ds in dashboard_json.get("datasets", []):
+        sql = "".join(ds.get("queryLines", [])) or ds.get("query", "")
+        if sql:
+            dataset_sql[ds["name"]] = sql
 
     for page in dashboard_json.get("pages", []):
+        page_name = page.get("displayName", "")
+        chart_index = 0
+        type_queue = list(page_type_queues.get(page_name, []))
+
         for item in page.get("layout", []):
             widget = item.get("widget", {})
             spec = widget.get("spec", {})
             if not isinstance(spec, dict):
                 continue
-
-            widget_type = spec.get("widgetType", "")
-            if widget_type not in _CHART_WIDGET_TYPES:
+            widget_type = spec.get("widgetType") or ""
+            if widget_type not in CHART_TYPES:
                 continue
 
-            encodings = spec.get("encodings", {})
-            if not isinstance(encodings, dict):
-                continue
-
-            color_enc = encodings.get("color")
-            if not isinstance(color_enc, dict):
-                continue
-
-            scale = color_enc.get("scale", {})
-            if not isinstance(scale, dict):
-                continue
-
-            if scale.get("type") != "categorical":
-                continue
-
-            if "range" in scale:
-                continue
-
-            # Check if this visual has specific PBI color assignments
-            widget_title = spec.get("frame", {}).get("title", "").lower()
-            matched_vis_colors = per_visual_colors.get(widget_title)
-
-            if matched_vis_colors:
-                cats_with_colors = [
-                    c for c in matched_vis_colors if "category" in c
-                ]
-                if cats_with_colors:
-                    scale["domain"] = [c["category"] for c in cats_with_colors]
-                    scale["range"] = [c["hex"] for c in cats_with_colors]
-                else:
-                    explicit_colors = [c["hex"] for c in matched_vis_colors]
-                    scale["range"] = explicit_colors
+            colors: list[str] | None = None
+            cmap: dict[str, str] = {}
+            if free_layout:
+                pairs = page_color_lists.get(page_name, [])
+                if chart_index < len(pairs):
+                    colors, cmap = pairs[chart_index]
             else:
-                scale["range"] = palette[:12]
+                pos = item.get("position", {}) or {}
+                key = (pos.get("x", -1), pos.get("y", -1))
+                colors = color_lookup.get(key)
+                cmap = cat_lookup.get(key, {})
+            chart_index += 1
 
-            color_enc["scale"] = scale
+            if not colors:
+                for i, (aibi_types, q_colors, q_cmap) in enumerate(type_queue):
+                    if widget_type in aibi_types:
+                        colors, cmap = q_colors, q_cmap
+                        type_queue.pop(i)
+                        break
+            else:
+                for i, (aibi_types, q_colors, q_cmap) in enumerate(type_queue):
+                    if q_colors is colors:
+                        type_queue.pop(i)
+                        break
+
+            if not colors:
+                continue
+
+            encodings = spec.setdefault("encodings", {})
+            color_enc = encodings.get("color") if isinstance(encodings, dict) else None
+            ds_name = (widget.get("queries") or [{}])[0].get("query", {}).get("datasetName", "")
+            sql = dataset_sql.get(ds_name, "")
+
+            if not isinstance(color_enc, dict):
+                if widget_type in {"bar", "area", "line"}:
+                    spec.setdefault("mark", {})["colors"] = colors
+                else:
+                    y_enc = encodings.get("y") if isinstance(encodings, dict) else None
+                    if not isinstance(y_enc, dict):
+                        continue
+                    y_field = y_enc.get("fieldName", "")
+                    if not y_field:
+                        continue
+                    encodings["color"] = {
+                        "fieldName": y_field,
+                        "scale": {"type": "quantitative", "colors": [colors[0]]},
+                        "displayName": y_enc.get("displayName", y_field),
+                    }
+                continue
+
+            scale = color_enc.setdefault("scale", {})
+            scale_type = scale.get("type", "categorical")
+
+            if scale_type == "quantitative":
+                if widget_type in {"bar", "area", "line"}:
+                    encodings.pop("color", None)
+                    spec.setdefault("mark", {})["color"] = colors[0]
+                else:
+                    scale["colors"] = [colors[0]]
+                continue
+
+            if cmap:
+                scale.pop("colors", None)
+                scale.pop("range", None)
+                scale["mappings"] = [
+                    {"value": v, "color": h} for v, h in cmap.items()
+                ]
+                continue
+
+            field_name = color_enc.get("fieldName", "")
+            if warehouse_id and sp_client and sql and field_name:
+                try:
+                    import time
+                    result = sp_client.statement_execution.execute_statement(
+                        warehouse_id=warehouse_id,
+                        statement=f"SELECT DISTINCT `{field_name}` FROM ({sql}) ORDER BY 1 LIMIT 100",
+                        wait_timeout="30s",
+                    )
+                    state = (result.status and result.status.state and result.status.state.value) or ""
+                    if state in ("PENDING", "RUNNING"):
+                        stmt_id = result.statement_id
+                        for _ in range(10):
+                            time.sleep(5)
+                            result = sp_client.statement_execution.get_statement(statement_id=stmt_id)
+                            state = (result.status and result.status.state and result.status.state.value) or ""
+                            if state not in ("PENDING", "RUNNING"):
+                                break
+                    rows = (result.result and result.result.data_array) or []
+                    values = [r[0] for r in rows if r and r[0] is not None]
+                    if values:
+                        scale.pop("colors", None)
+                        scale.pop("range", None)
+                        scale["mappings"] = [
+                            {"value": v, "color": colors[i % len(colors)]}
+                            for i, v in enumerate(values)
+                        ]
+                        continue
+                except Exception:
+                    pass
+
+            scale["colors"] = colors
 
     return dashboard_json
 

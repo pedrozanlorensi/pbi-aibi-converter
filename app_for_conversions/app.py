@@ -17,8 +17,10 @@ from typing import Any
 import streamlit as st
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.dashboards import Dashboard
+from databricks.sdk.service.iam import AccessControlRequest, PermissionLevel
 
 from clients import MODEL, STATIC_DIR, VALID_WIDGET_VERSIONS
+from color_utils import normalize_render_colors
 from export_pdf import build_export_pdf
 from converter import (
     extract_upload,
@@ -35,7 +37,7 @@ from converter import (
     call_llm_chunked,
     generate_explanation,
     extract_json_from_response,
-    apply_pbi_colors,
+    apply_brand_colors,
     _ensure_fqn_tables,
     fix_dataset_columns,
     _estimate_tokens,
@@ -49,8 +51,80 @@ from validator import validate_dashboard, validate_layout_fidelity, validate_tab
 
 st.set_page_config(page_title="PBI to AI/BI Converter", page_icon=":bar_chart:", layout="centered")
 st.markdown(
-    "<style>div[data-testid='stFileUploader'] small {display:none}</style>",
+    """
+    <style>
+    /* Widen the centered main column. Streamlit's default centered layout
+       caps the main block container at ~46rem which feels cramped once the
+       per-file controls (name + Overwrite + Remove) share a row. Bumping to
+       64rem keeps the page comfortably centered on widescreens while giving
+       each row enough horizontal space. Targets the modern testid and the
+       legacy class for cross-version robustness. */
+    [data-testid='stMainBlockContainer'],
+    section.main > .block-container,
+    .main .block-container {
+        max-width: 64rem !important;
+        padding-left: 2rem !important;
+        padding-right: 2rem !important;
+    }
+    /* Light first-pass: hide any <small> Streamlit might still emit. */
+    [data-testid='stFileUploader'] small,
+    section[data-testid='stFileUploaderDropzone'] small {
+        display: none !important;
+    }
+    /* Collapse the now-empty stock "drag and drop / Limit XGB" instructions
+       container so it stops eating flex space inside the dropzone. The JS
+       scrub below already hides its text leaves; this also removes the
+       wrapper from the layout entirely. NOTE: only the plural -Instructions
+       container — the singular -Instruction testid is the button in some
+       Streamlit versions and MUST stay visible. */
+    [data-testid='stFileUploaderDropzoneInstructions'] {
+        display: none !important;
+    }
+    /* Center the Upload button in the dropzone. Since the instructions
+       container is now collapsed, the button is the only visible child,
+       and Streamlit's default flex-start alignment leaves it stranded on
+       the left. Force a centered flex layout so the button sits in the
+       middle of the grey dropzone. */
+    section[data-testid='stFileUploaderDropzone'] {
+        display: flex !important;
+        justify-content: center !important;
+        align-items: center !important;
+    }
+    </style>
+    """,
     unsafe_allow_html=True,
+)
+# JS-based scrub for Streamlit's stock "Limit XGB per file • TYPES" helper.
+# The element's testid and tag have shifted across Streamlit releases, so a
+# pure CSS selector is fragile. Match on text content instead: any
+# child of the file-uploader dropzone whose own text starts with a
+# size-limit pattern gets hidden. Runs once on mount and again on every
+# DOM mutation (Streamlit re-renders the dropzone often).
+import streamlit.components.v1 as components
+components.html(
+    """
+    <script>
+    (function() {
+      const LIMIT_RE = /^\\s*\\d+(\\.\\d+)?\\s*(GB|MB|KB)\\b.*per\\s+file/i;
+      function scrub() {
+        const root = window.parent.document;
+        if (!root) return;
+        root.querySelectorAll(
+          '[data-testid="stFileUploader"] *, ' +
+          'section[data-testid="stFileUploaderDropzone"] *'
+        ).forEach(el => {
+          if (el.children.length === 0 && LIMIT_RE.test(el.textContent || '')) {
+            el.style.display = 'none';
+          }
+        });
+      }
+      scrub();
+      const obs = new MutationObserver(scrub);
+      obs.observe(window.parent.document.body, { childList: true, subtree: true });
+    })();
+    </script>
+    """,
+    height=0,
 )
 
 
@@ -91,11 +165,132 @@ if "batch_running" not in st.session_state:
 # Core conversion function (single report)
 # ---------------------------------------------------------------------------
 
-def convert_single_report(uploaded_file, report_name: str, progress, custom_instructions: str = "") -> ReportResult:
+def _find_existing_dashboard(
+    client: WorkspaceClient, report_name: str, parent_path: str,
+) -> tuple[str | None, str | None]:
+    """Look up an existing AI/BI dashboard matching `report_name`.
+
+    Returns `(exact_id, fallback_id)`:
+      * `exact_id`    — set when a dashboard matches BOTH `display_name`
+                        and `parent_path` (modulo trailing slashes).
+      * `fallback_id` — first dashboard with a matching `display_name`,
+                        regardless of folder. Used when the conflict is
+                        with a dashboard in a different parent or with no
+                        parent_path field surfaced.
+    """
+    target = parent_path.rstrip("/")
+    exact_id, fallback_id = None, None
+    try:
+        for d in client.lakeview.list():
+            if d.display_name != report_name:
+                continue
+            dpp = (getattr(d, "parent_path", None) or "").rstrip("/")
+            if dpp == target:
+                exact_id = d.dashboard_id
+                break
+            if fallback_id is None:
+                fallback_id = d.dashboard_id
+    except Exception:
+        pass
+    return exact_id, fallback_id
+
+
+def _executing_user_email() -> str | None:
+    """Resolve the email of the user currently using the app.
+
+    Databricks Apps forwards the authenticated user's email as the
+    `X-Forwarded-Email` HTTP header on every request. Streamlit
+    surfaces request headers via `st.context.headers`. Returns None
+    if the header is missing (e.g. running outside Databricks Apps,
+    such as local `streamlit run`).
+    """
+    try:
+        headers = st.context.headers
+    except Exception:
+        return None
+    if not headers:
+        return None
+    for key in ("X-Forwarded-Email", "x-forwarded-email"):
+        val = headers.get(key)
+        if val:
+            val = val.strip()
+            if val:
+                return val
+    return None
+
+
+def _grant_user_can_manage(
+    client: WorkspaceClient,
+    dashboard_id: str,
+    progress,
+) -> None:
+    """Best-effort: grant CAN_MANAGE on the freshly-created AI/BI
+    dashboard to whoever is currently using the app.
+
+    Uses `permissions.update` (PATCH semantics) rather than `set`
+    (PUT semantics), so the service principal's implicit ownership
+    and any existing ACEs are preserved. Failures are surfaced to
+    the progress log but never raise — the dashboard remains usable
+    by the SP regardless of whether the share succeeds.
+    """
+    user_email = _executing_user_email()
+    if not user_email:
+        progress.write(
+            "(skipped) Could not determine the executing user's email; "
+            "the dashboard is owned by the app's service principal. "
+            "Open the dashboard and use Share to grant yourself access."
+        )
+        return
+    try:
+        client.permissions.update(
+            request_object_type="dashboards",
+            request_object_id=dashboard_id,
+            access_control_list=[
+                AccessControlRequest(
+                    user_name=user_email,
+                    permission_level=PermissionLevel.CAN_MANAGE,
+                )
+            ],
+        )
+        progress.write(f"Granted CAN_MANAGE on dashboard to {user_email}.")
+    except Exception as perm_err:
+        progress.write(
+            f"(non-fatal) Could not grant CAN_MANAGE to {user_email}: "
+            f"{perm_err}"
+        )
+
+
+def convert_single_report(
+    uploaded_file,
+    report_name: str,
+    progress,
+    custom_instructions: str = "",
+    preserve_colors: bool = True,
+    overwrite: bool = False,
+) -> ReportResult:
     """Run the full conversion pipeline for one report. Returns a ReportResult."""
     result = ReportResult(name=report_name, status="running")
 
     try:
+        client = WorkspaceClient()
+
+        warehouse_id = (os.getenv("DATABRICKS_WAREHOUSE_ID") or "").strip()
+        if not warehouse_id:
+            try:
+                first = next(iter(client.warehouses.list()), None)
+                if first is None:
+                    result.status = "error"
+                    result.error_msg = (
+                        "No SQL warehouse available. Set DATABRICKS_WAREHOUSE_ID in app.yaml "
+                        "or grant the app's service principal CAN_USE on a warehouse."
+                    )
+                    return result
+                warehouse_id = first.id
+            except Exception as e:
+                result.status = "error"
+                result.error_msg = f"Could not list SQL warehouses: {e}"
+                return result
+
         # --- Phase 1: Extract & Parse ---
         progress.write("Extracting uploaded files...")
         tmpdir = extract_upload(uploaded_file)
@@ -171,10 +366,6 @@ def convert_single_report(uploaded_file, report_name: str, progress, custom_inst
         progress.write("Parsing dashboard JSON...")
         dashboard_json = extract_json_from_response(raw_response)
 
-        if color_palette.data_colors:
-            progress.write("Applying PBI color palette to chart widgets...")
-            dashboard_json = apply_pbi_colors(dashboard_json, color_palette, pbi_layout)
-
         result.dashboard_json = dashboard_json
         result.n_datasets = len(dashboard_json.get("datasets", []))
         result.n_pages = len(dashboard_json.get("pages", []))
@@ -182,28 +373,55 @@ def convert_single_report(uploaded_file, report_name: str, progress, custom_inst
         progress.write(f"Generated {result.n_datasets} datasets, {result.n_pages} pages, {result.n_widgets} widgets")
 
         # --- Phase 3: SQL column check & fix ---
-        sp_client = WorkspaceClient()
-
-        warehouse_id = os.getenv("DATABRICKS_WAREHOUSE_ID")
-        if not warehouse_id:
-            for wh in sp_client.warehouses.list():
-                warehouse_id = wh.id
-                break
-        if not warehouse_id:
-            result.status = "error"
-            result.error_msg = "No SQL warehouse found. Please set DATABRICKS_WAREHOUSE_ID."
-            return result
-
         progress.write("Ensuring fully-qualified table names...")
         dashboard_json = _ensure_fqn_tables(dashboard_json)
 
         progress.write("Checking dataset SQL against UC tables...")
-        dashboard_json = fix_dataset_columns(dashboard_json, warehouse_id, sp_client)
+        dashboard_json = fix_dataset_columns(dashboard_json, warehouse_id, client)
+
+        # Brand color injection runs AFTER fix_dataset_columns so the SQL it
+        # uses to query for distinct categorical values is the corrected,
+        # column-validated version. Skipped when the user turned off
+        # "Preserve brand colors" — in that case AI/BI defaults apply.
+        colored_visuals = [
+            v for p in pbi_layout.pages for v in p.data_visuals if v.colors
+        ]
+        if preserve_colors and colored_visuals:
+            progress.write(
+                f"Injecting brand colors from {len(colored_visuals)} PBI visual(s)..."
+            )
+            dashboard_json = apply_brand_colors(
+                dashboard_json,
+                pbi_layout,
+                warehouse_id=warehouse_id,
+                sp_client=client,
+                free_layout=True,
+            )
+        elif preserve_colors:
+            progress.write(
+                "No per-visual brand colors found in PBI report — "
+                "using Databricks default palette."
+            )
+        else:
+            progress.write(
+                "Brand color preservation disabled — using Databricks defaults."
+            )
+
+        # Color scheme validation: ensures the AI/BI renderer actually
+        # honors the colors we just injected (pie charts ignore scale.colors,
+        # single-series line/bar charts need mark.color singular, etc.).
+        # Categorical pie charts get scale.mappings built by querying the
+        # warehouse for distinct values of the color field.
+        if preserve_colors:
+            progress.write("Normalizing chart colors for AI/BI renderer...")
+            dashboard_json = normalize_render_colors(
+                dashboard_json, sp_client=client, warehouse_id=warehouse_id,
+            )
         result.dashboard_json = dashboard_json
 
         # --- Phase 4: Validation ---
         progress.write("Validating dashboard...")
-        validation = validate_dashboard(dashboard_json, warehouse_id, sp_client)
+        validation = validate_dashboard(dashboard_json, warehouse_id, client)
 
         progress.write("Validating layout fidelity against PBI source...")
         layout_fidelity = validate_layout_fidelity(dashboard_json, pbi_layout)
@@ -219,8 +437,11 @@ def convert_single_report(uploaded_file, report_name: str, progress, custom_inst
 
         # --- Phase 5: Deploy ---
         progress.write("Deploying to Databricks workspace...")
-        parent_path = f"/Workspace/Shared/aibi_converter/{report_name}"
-        sp_client.workspace.mkdirs(parent_path)
+        parent_root = (
+            os.getenv("DASHBOARD_PARENT_PATH") or "/Workspace/Shared/aibi_converter"
+        ).rstrip("/")
+        parent_path = f"{parent_root}/{report_name}"
+        client.workspace.mkdirs(parent_path)
 
         serialized = json.dumps(dashboard_json, indent=2)
         dashboard_obj = Dashboard(
@@ -230,35 +451,62 @@ def convert_single_report(uploaded_file, report_name: str, progress, custom_inst
             warehouse_id=warehouse_id,
         )
 
+        if overwrite:
+            exact_id, fallback_id = _find_existing_dashboard(
+                client, report_name, parent_path,
+            )
+            for victim in filter(None, [exact_id, fallback_id]):
+                try:
+                    progress.write(f"Overwrite: trashing existing dashboard {victim}...")
+                    client.lakeview.trash(dashboard_id=victim)
+                except Exception as trash_err:
+                    progress.write(f"(non-fatal) could not trash {victim}: {trash_err}")
+            target_file = f"{parent_path}/{report_name}.lvdash.json"
+            try:
+                progress.write(f"Overwrite: deleting workspace file {target_file}...")
+                client.workspace.delete(path=target_file, recursive=False)
+            except Exception:
+                pass
+
         try:
-            api_result = sp_client.lakeview.create(dashboard=dashboard_obj)
+            api_result = client.lakeview.create(dashboard=dashboard_obj)
         except Exception as create_err:
-            if "already exists" in str(create_err):
-                progress.write("Dashboard already exists, updating...")
-                existing_id = None
-                for d in sp_client.lakeview.list():
-                    if d.display_name == report_name:
-                        existing_id = d.dashboard_id
-                        break
-                if not existing_id:
-                    ws_path = f"{parent_path}/{report_name}.lvdash.json"
-                    try:
-                        sp_client.workspace.delete(ws_path)
-                    except Exception:
-                        pass
-                    api_result = sp_client.lakeview.create(dashboard=dashboard_obj)
-                else:
-                    api_result = sp_client.lakeview.update(dashboard_id=existing_id, dashboard=dashboard_obj)
+            err_text = str(create_err).lower()
+            if "already exists" not in err_text:
+                raise
+            exact_id, fallback_id = _find_existing_dashboard(
+                client, report_name, parent_path,
+            )
+            if exact_id:
+                progress.write(f"Dashboard already exists, updating {exact_id}...")
+                api_result = client.lakeview.update(
+                    dashboard_id=exact_id, dashboard=dashboard_obj,
+                )
+            elif not overwrite:
+                result.status = "error"
+                result.error_msg = (
+                    f"A node named '{report_name}' already exists at "
+                    f"`{parent_path}` (likely an orphaned workspace file or a "
+                    "dashboard in a different folder). Check the **Overwrite** "
+                    "box next to this report's name and re-run to replace it, "
+                    "or pick a different dashboard name."
+                )
+                return result
             else:
                 raise
 
         result.dashboard_id = api_result.dashboard_id
-        host = sp_client.config.host.rstrip("/")
+        host = client.config.host.rstrip("/")
         result.dash_url = f"{host}/sql/dashboardsv3/{result.dashboard_id}"
         result.workspace_path = f"{parent_path}/{report_name}.lvdash.json"
 
+        progress.write("Granting CAN_MANAGE to the executing user...")
+        _grant_user_can_manage(client, result.dashboard_id, progress)
+
         progress.write("Publishing dashboard...")
-        sp_client.lakeview.publish(dashboard_id=result.dashboard_id, warehouse_id=warehouse_id)
+        client.lakeview.publish(
+            dashboard_id=result.dashboard_id, warehouse_id=warehouse_id,
+        )
 
         progress.write("Generating conversion report...")
         result.explanation = generate_explanation(report_name, pbi_context, dashboard_json)
@@ -383,7 +631,7 @@ def _render_tables_section(res: ReportResult):
                     f"({', '.join(unique_types)}). These need to be accessible from your Databricks workspace."
                 )
             elif summary_parts:
-                st.success(". ".join(summary_parts) + ". No migration needed.")
+                st.success(". ".join(summary_parts) + ". No data migration needed.")
 
             table_rows = []
             for tbl in tc.queried_tables:
@@ -556,14 +804,25 @@ def _render_validation_section(res: ReportResult):
 
 st.title("Power BI -> AI/BI Converter")
 st.caption(
-    f"Upload up to **10** Power BI projects (.pbip) as **zip files** and convert them to "
-    f"Databricks AI/BI dashboards using **{MODEL}**."
+    f"Upload up to **10** Power BI reports and convert them to "
+    f"Databricks AI/BI dashboards using Gen AI with **{MODEL}**."
 )
 
 with st.expander("How to prepare your upload", icon=":material/help:"):
+    st.warning(
+        "**One report per file.** Each upload (`.pbit` or `.zip`) must "
+        "contain exactly one Power BI report. Do not bundle multiple "
+        "reports into the same zip; upload them as separate files instead "
+        "(the converter handles batches of up to 10)."
+    )
     st.markdown(
-        "**Step 1 — Export as .pbip from Power BI Desktop**\n\n"
-        'In Power BI Desktop, go to **File -> Save As** and select '
+        "Two upload formats are supported:\n\n"
+        "### Option A: Upload a `.pbit` template (simplest)\n"
+        "In Power BI Desktop, go to **File -> Export -> Power BI template** "
+        "and save the resulting `.pbit` file. Drag it into the uploader below "
+        "as-is (no zipping needed).\n\n"
+        "### Option B: Upload a zipped `.pbip` project\n"
+        "In Power BI Desktop, go to **File -> Save As** and select "
         '**Power BI project files (*.pbip)** from the "Save as type" dropdown:'
     )
     pbip_img = STATIC_DIR / "power_bi_save_as_pbip.png"
@@ -574,24 +833,176 @@ with st.expander("How to prepare your upload", icon=":material/help:"):
         "- `YourReport.pbip` — project file\n"
         "- `YourReport.Report/` — report visuals & pages\n"
         "- `YourReport.SemanticModel/` — data model & table definitions\n\n"
-        "**Step 2 — Zip the results**\n\n"
         "Select all three items, right-click -> **Compress** (macOS) or **Send to -> Compressed folder** (Windows). "
         "Upload the resulting `.zip` file below."
     )
 
 st.divider()
 
-uploaded_files = st.file_uploader(
-    "Upload .pbip project(s) (zip files)",
-    type=["zip"],
-    accept_multiple_files=True,
-    help="Zip(s) containing the .pbip file, .Report/ folder, and .SemanticModel/ folder. Max 10 files.",
+def _dash_name_key(uf) -> str:
+    """Stable session_state key for a file's dashboard name input.
+
+    Uses (name, size) so the key survives Streamlit reruns and is unaffected
+    by file reordering. Independent of file_uploader's internal `file_id`.
+    """
+    size = getattr(uf, "size", None)
+    return f"dashname::{uf.name}::{size}"
+
+
+def _resolve_dashboard_name(uf) -> str:
+    """Read the user-entered dashboard name from session_state, falling back
+    to the filename basename."""
+    default = os.path.splitext(uf.name)[0]
+    val = st.session_state.get(_dash_name_key(uf), default)
+    if not isinstance(val, str):
+        val = default
+    val = val.strip()
+    return val or default
+
+
+def _dash_overwrite_key(uf) -> str:
+    """Stable session_state key for a file's overwrite checkbox."""
+    size = getattr(uf, "size", None)
+    return f"dashoverwrite::{uf.name}::{size}"
+
+
+def _resolve_overwrite(uf) -> bool:
+    return bool(st.session_state.get(_dash_overwrite_key(uf), False))
+
+
+def _remove_uploaded_file(key: str) -> None:
+    """Mark a single uploaded file as removed and rerun.
+
+    The widget itself still holds the file internally, but we filter it out
+    of every downstream consumer by checking `removed_file_keys`.
+    """
+    st.session_state.setdefault("removed_file_keys", set()).add(key)
+
+
+def _clear_all_uploaded_files() -> None:
+    """Reset the file_uploader widget entirely.
+
+    Increments the nonce so the widget gets a new `key` on the next render,
+    which forces Streamlit to treat it as a fresh widget with no files. Also
+    clears the per-file `removed_file_keys` set so re-uploaded files behave
+    normally.
+    """
+    st.session_state["uploader_nonce"] = (
+        st.session_state.get("uploader_nonce", 0) + 1
+    )
+    st.session_state["removed_file_keys"] = set()
+
+
+st.markdown(
+    "**One report per file.** Upload one `.pbit` template or one "
+    "compressed `.pbip` project (`.zip` file) per dashboard. "
 )
-st.caption("Dashboards will be named after the uploaded zip files.")
+
+if "uploader_nonce" not in st.session_state:
+    st.session_state["uploader_nonce"] = 0
+if "removed_file_keys" not in st.session_state:
+    st.session_state["removed_file_keys"] = set()
+
+uploaded_files = st.file_uploader(
+    "Upload .pbit or zipped .pbip project(s)",
+    type=["zip", "pbit"],
+    accept_multiple_files=True,
+    help=(
+        ".zip (full .pbip project, including .Report and .SemanticModel "
+        "folders) and .pbit are supported (do not zip more than one "
+        "dashboard altogether)"
+    ),
+    key=f"uploader_{st.session_state['uploader_nonce']}",
+)
+
+if uploaded_files:
+    uploaded_files = [
+        uf
+        for uf in uploaded_files
+        if _dash_name_key(uf) not in st.session_state["removed_file_keys"]
+    ]
 
 if uploaded_files and len(uploaded_files) > 10:
     st.error("Please upload at most 10 files at a time.")
     st.stop()
+
+
+if uploaded_files:
+    with st.container(border=True):
+        st.markdown("**Dashboard names**")
+        st.caption(
+            "These will be the published dashboard names. Edit any of them "
+            "below before clicking Convert & Publish. If a dashboard with "
+            "the same name already exists, check **Overwrite** to replace it. "
+            "Use **Remove** to drop a single file, or **Clear all uploaded "
+            "files** at the bottom to start over."
+        )
+        for uf in uploaded_files:
+            default = os.path.splitext(uf.name)[0]
+            name_col, ovw_col, rm_col = st.columns([5, 1, 1])
+            with name_col:
+                st.text_input(
+                    label=uf.name,
+                    value=default,
+                    key=_dash_name_key(uf),
+                    help=f"Source file: `{uf.name}`",
+                )
+            with ovw_col:
+                st.markdown(
+                    "<div style='height:1.75rem'></div>",
+                    unsafe_allow_html=True,
+                )
+                st.checkbox(
+                    "Overwrite",
+                    value=False,
+                    key=_dash_overwrite_key(uf),
+                    help=(
+                        "Replace any existing dashboard with this name. "
+                        "Trashes the matching AI/BI dashboard and deletes "
+                        "the target workspace file before publishing fresh. "
+                        "Leave unchecked to fail safely on name conflicts."
+                    ),
+                )
+            with rm_col:
+                st.markdown(
+                    "<div style='height:1.75rem'></div>",
+                    unsafe_allow_html=True,
+                )
+                st.button(
+                    "Remove",
+                    key=f"remove::{_dash_name_key(uf)}",
+                    help=(
+                        "Drop this file from the batch. Other uploaded files "
+                        "and their settings are kept."
+                    ),
+                    on_click=_remove_uploaded_file,
+                    args=(_dash_name_key(uf),),
+                    use_container_width=True,
+                )
+        st.divider()
+        st.button(
+            "Clear all uploaded files",
+            type="secondary",
+            help=(
+                "Reset the uploader to empty. Removes every file from the "
+                "batch but keeps your color and custom-instructions settings."
+            ),
+            on_click=_clear_all_uploaded_files,
+        )
+
+with st.container(border=True):
+    st.markdown("**Color scheme**")
+    _preserve_colors = st.toggle(
+        "Preserve brand colors from the PBI report",
+        value=st.session_state.get("preserve_colors_toggle", True),
+        help=(
+            "Extract hex colors from each PBI visual (data point fills, "
+            "category color assignments) and inject them into the generated "
+            "AI/BI dashboard widgets. Turn off to fall back to the Databricks "
+            "default palette."
+        ),
+        key="preserve_colors_toggle",
+    )
 
 custom_instructions = st.text_area(
     "Custom Instructions (optional)",
@@ -616,7 +1027,32 @@ convert_clicked = st.button("Convert & Publish", type="primary", use_container_w
 
 if convert_clicked:
     if not uploaded_files:
-        st.error("Please upload at least one .pbip zip file.")
+        st.error("Please upload at least one .pbit file or zipped .pbip project.")
+        st.stop()
+
+    # Resolve and validate the per-file dashboard names from the rename inputs.
+    invalid_chars = set('/\\:*?"<>|')
+    resolved_names: list[str] = []
+    for uf in uploaded_files:
+        name = _resolve_dashboard_name(uf)
+        bad = sorted(c for c in invalid_chars if c in name)
+        if bad:
+            st.error(
+                f"Dashboard name for `{uf.name}` contains invalid character(s): "
+                f"`{''.join(bad)}`. Avoid `/ \\ : * ? \" < > |`."
+            )
+            st.stop()
+        resolved_names.append(name)
+
+    if len(set(resolved_names)) < len(resolved_names):
+        seen: dict[str, int] = {}
+        for n in resolved_names:
+            seen[n] = seen.get(n, 0) + 1
+        dupes = sorted(n for n, c in seen.items() if c > 1)
+        st.error(
+            "Two or more uploads share the same dashboard name. "
+            f"Please make each unique. Duplicates: {', '.join(repr(d) for d in dupes)}."
+        )
         st.stop()
 
     st.session_state["results"] = []
@@ -628,12 +1064,18 @@ if convert_clicked:
     overall.markdown(f"### Batch conversion: {n_files} report(s)")
 
     for idx, uf in enumerate(uploaded_files):
-        report_name = os.path.splitext(uf.name)[0]
+        report_name = resolved_names[idx]
+        overwrite_flag = _resolve_overwrite(uf)
 
         overall.markdown(f"---\n**[{idx + 1}/{n_files}]** Converting **{report_name}**...")
         progress = overall.status(f"Converting {report_name}...", expanded=True)
 
-        result = convert_single_report(uf, report_name, progress, custom_instructions=custom_instructions)
+        result = convert_single_report(
+            uf, report_name, progress,
+            custom_instructions=custom_instructions,
+            preserve_colors=_preserve_colors,
+            overwrite=overwrite_flag,
+        )
         results.append(result)
 
         if result.status == "done":
