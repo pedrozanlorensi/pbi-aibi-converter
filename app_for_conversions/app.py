@@ -17,6 +17,7 @@ from typing import Any
 import streamlit as st
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.dashboards import Dashboard
+from databricks.sdk.service.iam import AccessControlRequest, PermissionLevel
 
 from clients import MODEL, STATIC_DIR, VALID_WIDGET_VERSIONS
 from color_utils import normalize_render_colors
@@ -52,10 +53,42 @@ st.set_page_config(page_title="PBI to AI/BI Converter", page_icon=":bar_chart:",
 st.markdown(
     """
     <style>
+    /* Widen the centered main column. Streamlit's default centered layout
+       caps the main block container at ~46rem which feels cramped once the
+       per-file controls (name + Overwrite + Remove) share a row. Bumping to
+       64rem keeps the page comfortably centered on widescreens while giving
+       each row enough horizontal space. Targets the modern testid and the
+       legacy class for cross-version robustness. */
+    [data-testid='stMainBlockContainer'],
+    section.main > .block-container,
+    .main .block-container {
+        max-width: 64rem !important;
+        padding-left: 2rem !important;
+        padding-right: 2rem !important;
+    }
     /* Light first-pass: hide any <small> Streamlit might still emit. */
     [data-testid='stFileUploader'] small,
     section[data-testid='stFileUploaderDropzone'] small {
         display: none !important;
+    }
+    /* Collapse the now-empty stock "drag and drop / Limit XGB" instructions
+       container so it stops eating flex space inside the dropzone. The JS
+       scrub below already hides its text leaves; this also removes the
+       wrapper from the layout entirely. NOTE: only the plural -Instructions
+       container — the singular -Instruction testid is the button in some
+       Streamlit versions and MUST stay visible. */
+    [data-testid='stFileUploaderDropzoneInstructions'] {
+        display: none !important;
+    }
+    /* Center the Upload button in the dropzone. Since the instructions
+       container is now collapsed, the button is the only visible child,
+       and Streamlit's default flex-start alignment leaves it stranded on
+       the left. Force a centered flex layout so the button sits in the
+       middle of the grey dropzone. */
+    section[data-testid='stFileUploaderDropzone'] {
+        display: flex !important;
+        justify-content: center !important;
+        align-items: center !important;
     }
     </style>
     """,
@@ -160,6 +193,71 @@ def _find_existing_dashboard(
     except Exception:
         pass
     return exact_id, fallback_id
+
+
+def _executing_user_email() -> str | None:
+    """Resolve the email of the user currently using the app.
+
+    Databricks Apps forwards the authenticated user's email as the
+    `X-Forwarded-Email` HTTP header on every request. Streamlit
+    surfaces request headers via `st.context.headers`. Returns None
+    if the header is missing (e.g. running outside Databricks Apps,
+    such as local `streamlit run`).
+    """
+    try:
+        headers = st.context.headers
+    except Exception:
+        return None
+    if not headers:
+        return None
+    for key in ("X-Forwarded-Email", "x-forwarded-email"):
+        val = headers.get(key)
+        if val:
+            val = val.strip()
+            if val:
+                return val
+    return None
+
+
+def _grant_user_can_manage(
+    client: WorkspaceClient,
+    dashboard_id: str,
+    progress,
+) -> None:
+    """Best-effort: grant CAN_MANAGE on the freshly-created AI/BI
+    dashboard to whoever is currently using the app.
+
+    Uses `permissions.update` (PATCH semantics) rather than `set`
+    (PUT semantics), so the service principal's implicit ownership
+    and any existing ACEs are preserved. Failures are surfaced to
+    the progress log but never raise — the dashboard remains usable
+    by the SP regardless of whether the share succeeds.
+    """
+    user_email = _executing_user_email()
+    if not user_email:
+        progress.write(
+            "(skipped) Could not determine the executing user's email; "
+            "the dashboard is owned by the app's service principal. "
+            "Open the dashboard and use Share to grant yourself access."
+        )
+        return
+    try:
+        client.permissions.update(
+            request_object_type="dashboards",
+            request_object_id=dashboard_id,
+            access_control_list=[
+                AccessControlRequest(
+                    user_name=user_email,
+                    permission_level=PermissionLevel.CAN_MANAGE,
+                )
+            ],
+        )
+        progress.write(f"Granted CAN_MANAGE on dashboard to {user_email}.")
+    except Exception as perm_err:
+        progress.write(
+            f"(non-fatal) Could not grant CAN_MANAGE to {user_email}: "
+            f"{perm_err}"
+        )
 
 
 def convert_single_report(
@@ -401,6 +499,9 @@ def convert_single_report(
         host = client.config.host.rstrip("/")
         result.dash_url = f"{host}/sql/dashboardsv3/{result.dashboard_id}"
         result.workspace_path = f"{parent_path}/{report_name}.lvdash.json"
+
+        progress.write("Granting CAN_MANAGE to the executing user...")
+        _grant_user_can_manage(client, result.dashboard_id, progress)
 
         progress.write("Publishing dashboard...")
         client.lakeview.publish(
@@ -703,9 +804,8 @@ def _render_validation_section(res: ReportResult):
 
 st.title("Power BI -> AI/BI Converter")
 st.caption(
-    f"Upload up to **10** Power BI reports — **one file per dashboard** "
-    f"(`.pbit` template or `.zip`'d `.pbip` project) — and convert them to "
-    f"Databricks AI/BI dashboards using **{MODEL}**."
+    f"Upload up to **10** Power BI reports and convert them to "
+    f"Databricks AI/BI dashboards using Gen AI with **{MODEL}**."
 )
 
 with st.expander("How to prepare your upload", icon=":material/help:"):
@@ -717,11 +817,11 @@ with st.expander("How to prepare your upload", icon=":material/help:"):
     )
     st.markdown(
         "Two upload formats are supported:\n\n"
-        "### Option A — Upload a `.pbit` template (simplest)\n"
+        "### Option A: Upload a `.pbit` template (simplest)\n"
         "In Power BI Desktop, go to **File -> Export -> Power BI template** "
         "and save the resulting `.pbit` file. Drag it into the uploader below "
-        "as-is — no zipping needed.\n\n"
-        "### Option B — Upload a zipped `.pbip` project\n"
+        "as-is (no zipping needed).\n\n"
+        "### Option B: Upload a zipped `.pbip` project\n"
         "In Power BI Desktop, go to **File -> Save As** and select "
         '**Power BI project files (*.pbip)** from the "Save as type" dropdown:'
     )
@@ -738,41 +838,6 @@ with st.expander("How to prepare your upload", icon=":material/help:"):
     )
 
 st.divider()
-
-with st.container(border=True):
-    st.markdown("**Color scheme**")
-    _preserve_colors = st.toggle(
-        "Preserve brand colors from the PBI report",
-        value=st.session_state.get("preserve_colors_toggle", True),
-        help=(
-            "Extract hex colors from each PBI visual (data point fills, "
-            "category color assignments) and inject them into the generated "
-            "AI/BI dashboard widgets. Turn off to fall back to the Databricks "
-            "default palette."
-        ),
-        key="preserve_colors_toggle",
-    )
-
-st.markdown(
-    "**One report per file.** Upload one `.pbit` template or one "
-    "compressed `.pbip` project (`.zip` file) per dashboard. Do not combine multiple "
-    "reports into the same zip — upload them as separate files."
-)
-uploaded_files = st.file_uploader(
-    "Upload .pbit or zipped .pbip project(s)",
-    type=["zip", "pbit"],
-    accept_multiple_files=True,
-    help=(
-        ".zip (full .pbip project, including .Report and .SemanticModel "
-        "folders) and .pbit are supported (do not zip more than one "
-        "dashboard altogether)"
-    ),
-)
-
-if uploaded_files and len(uploaded_files) > 10:
-    st.error("Please upload at most 10 files at a time.")
-    st.stop()
-
 
 def _dash_name_key(uf) -> str:
     """Stable session_state key for a file's dashboard name input.
@@ -805,17 +870,76 @@ def _resolve_overwrite(uf) -> bool:
     return bool(st.session_state.get(_dash_overwrite_key(uf), False))
 
 
+def _remove_uploaded_file(key: str) -> None:
+    """Mark a single uploaded file as removed and rerun.
+
+    The widget itself still holds the file internally, but we filter it out
+    of every downstream consumer by checking `removed_file_keys`.
+    """
+    st.session_state.setdefault("removed_file_keys", set()).add(key)
+
+
+def _clear_all_uploaded_files() -> None:
+    """Reset the file_uploader widget entirely.
+
+    Increments the nonce so the widget gets a new `key` on the next render,
+    which forces Streamlit to treat it as a fresh widget with no files. Also
+    clears the per-file `removed_file_keys` set so re-uploaded files behave
+    normally.
+    """
+    st.session_state["uploader_nonce"] = (
+        st.session_state.get("uploader_nonce", 0) + 1
+    )
+    st.session_state["removed_file_keys"] = set()
+
+
+st.markdown(
+    "**One report per file.** Upload one `.pbit` template or one "
+    "compressed `.pbip` project (`.zip` file) per dashboard. "
+)
+
+if "uploader_nonce" not in st.session_state:
+    st.session_state["uploader_nonce"] = 0
+if "removed_file_keys" not in st.session_state:
+    st.session_state["removed_file_keys"] = set()
+
+uploaded_files = st.file_uploader(
+    "Upload .pbit or zipped .pbip project(s)",
+    type=["zip", "pbit"],
+    accept_multiple_files=True,
+    help=(
+        ".zip (full .pbip project, including .Report and .SemanticModel "
+        "folders) and .pbit are supported (do not zip more than one "
+        "dashboard altogether)"
+    ),
+    key=f"uploader_{st.session_state['uploader_nonce']}",
+)
+
+if uploaded_files:
+    uploaded_files = [
+        uf
+        for uf in uploaded_files
+        if _dash_name_key(uf) not in st.session_state["removed_file_keys"]
+    ]
+
+if uploaded_files and len(uploaded_files) > 10:
+    st.error("Please upload at most 10 files at a time.")
+    st.stop()
+
+
 if uploaded_files:
     with st.container(border=True):
         st.markdown("**Dashboard names**")
         st.caption(
             "These will be the published dashboard names. Edit any of them "
             "below before clicking Convert & Publish. If a dashboard with "
-            "the same name already exists, check **Overwrite** to replace it."
+            "the same name already exists, check **Overwrite** to replace it. "
+            "Use **Remove** to drop a single file, or **Clear all uploaded "
+            "files** at the bottom to start over."
         )
         for uf in uploaded_files:
             default = os.path.splitext(uf.name)[0]
-            name_col, ovw_col = st.columns([4, 1])
+            name_col, ovw_col, rm_col = st.columns([5, 1, 1])
             with name_col:
                 st.text_input(
                     label=uf.name,
@@ -824,6 +948,10 @@ if uploaded_files:
                     help=f"Source file: `{uf.name}`",
                 )
             with ovw_col:
+                st.markdown(
+                    "<div style='height:1.75rem'></div>",
+                    unsafe_allow_html=True,
+                )
                 st.checkbox(
                     "Overwrite",
                     value=False,
@@ -835,6 +963,46 @@ if uploaded_files:
                         "Leave unchecked to fail safely on name conflicts."
                     ),
                 )
+            with rm_col:
+                st.markdown(
+                    "<div style='height:1.75rem'></div>",
+                    unsafe_allow_html=True,
+                )
+                st.button(
+                    "Remove",
+                    key=f"remove::{_dash_name_key(uf)}",
+                    help=(
+                        "Drop this file from the batch. Other uploaded files "
+                        "and their settings are kept."
+                    ),
+                    on_click=_remove_uploaded_file,
+                    args=(_dash_name_key(uf),),
+                    use_container_width=True,
+                )
+        st.divider()
+        st.button(
+            "Clear all uploaded files",
+            type="secondary",
+            help=(
+                "Reset the uploader to empty. Removes every file from the "
+                "batch but keeps your color and custom-instructions settings."
+            ),
+            on_click=_clear_all_uploaded_files,
+        )
+
+with st.container(border=True):
+    st.markdown("**Color scheme**")
+    _preserve_colors = st.toggle(
+        "Preserve brand colors from the PBI report",
+        value=st.session_state.get("preserve_colors_toggle", True),
+        help=(
+            "Extract hex colors from each PBI visual (data point fills, "
+            "category color assignments) and inject them into the generated "
+            "AI/BI dashboard widgets. Turn off to fall back to the Databricks "
+            "default palette."
+        ),
+        key="preserve_colors_toggle",
+    )
 
 custom_instructions = st.text_area(
     "Custom Instructions (optional)",
