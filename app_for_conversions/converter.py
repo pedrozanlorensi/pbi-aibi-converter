@@ -338,6 +338,117 @@ def _tmsl_model_to_tmdl(model: dict) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+def _synthesize_pbir_from_legacy_layout(report_dir: str) -> None:
+    """Convert a legacy monolithic Report/Layout into the PBIR
+    definition/pages/ structure expected by the rest of the pipeline.
+
+    The legacy Layout is a single JSON (UTF-16 LE) containing all pages
+    as ``sections[]`` and all visuals as ``visualContainers[]`` within
+    each section. This function explodes it into individual page.json
+    and visual.json files under ``report_dir/definition/pages/``.
+    """
+    layout_path = os.path.join(report_dir, "Layout")
+    if not os.path.isfile(layout_path):
+        return
+
+    raw_text = _decode_pbi_text_file(layout_path)
+    try:
+        layout = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return
+
+    sections = layout.get("sections", [])
+    if not sections:
+        return
+
+    pages_dir = os.path.join(report_dir, "definition", "pages")
+    os.makedirs(pages_dir, exist_ok=True)
+
+    page_order = []
+    sorted_sections = sorted(sections, key=lambda s: s.get("ordinal", 0))
+
+    for section in sorted_sections:
+        page_id = section.get("name", f"page_{section.get('ordinal', 0)}")
+        display_name = section.get("displayName", page_id)
+        page_order.append(page_id)
+
+        page_path = os.path.join(pages_dir, page_id)
+        os.makedirs(page_path, exist_ok=True)
+
+        page_meta = {
+            "displayName": display_name,
+            "name": page_id,
+            "width": section.get("width", 1280),
+            "height": section.get("height", 720),
+        }
+        with open(os.path.join(page_path, "page.json"), "w", encoding="utf-8") as f:
+            json.dump(page_meta, f, indent=2)
+
+        visuals_dir = os.path.join(page_path, "visuals")
+        os.makedirs(visuals_dir, exist_ok=True)
+
+        for vc in section.get("visualContainers", []):
+            config_str = vc.get("config", "{}")
+            try:
+                config = json.loads(config_str) if isinstance(config_str, str) else config_str
+            except json.JSONDecodeError:
+                config = {}
+
+            vis_name = config.get("name", vc.get("id", ""))
+            if not vis_name:
+                continue
+
+            sv = config.get("singleVisual", {})
+            visual_type = sv.get("visualType", "unknown")
+
+            visual_obj: dict = {
+                "name": vis_name,
+                "position": {
+                    "x": vc.get("x", 0),
+                    "y": vc.get("y", 0),
+                    "width": vc.get("width", 100),
+                    "height": vc.get("height", 100),
+                    "z": vc.get("z", 0),
+                },
+                "visual": {
+                    "visualType": visual_type,
+                },
+            }
+
+            for key in ("projections", "prototypeQuery", "columnProperties",
+                        "dataTransforms", "sort"):
+                if key in sv:
+                    visual_obj["visual"][key] = sv[key]
+
+            if "singleVisual" in sv:
+                visual_obj["visual"]["singleVisual"] = sv["singleVisual"]
+
+            dt = vc.get("dataTransforms")
+            if dt:
+                try:
+                    dt_parsed = json.loads(dt) if isinstance(dt, str) else dt
+                    visual_obj["visual"]["dataTransforms"] = dt_parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            query = vc.get("query")
+            if query:
+                try:
+                    q_parsed = json.loads(query) if isinstance(query, str) else query
+                    visual_obj["visual"]["prototypeQuery"] = q_parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            vis_dir = os.path.join(visuals_dir, vis_name)
+            os.makedirs(vis_dir, exist_ok=True)
+            with open(os.path.join(vis_dir, "visual.json"), "w", encoding="utf-8") as f:
+                json.dump(visual_obj, f, indent=2)
+
+    pages_meta = {"pageOrder": page_order}
+    with open(os.path.join(pages_dir, "pages.json"), "w", encoding="utf-8") as f:
+        json.dump(pages_meta, f, indent=2)
+
+
 def _synthesize_pbip_from_pbit(tmpdir: str, base_name: str) -> None:
     """Convert an extracted .pbit layout into the .pbip layout expected
     by the rest of the converter.
@@ -364,12 +475,17 @@ def _synthesize_pbip_from_pbit(tmpdir: str, base_name: str) -> None:
     # unzip, but handle nested locations defensively.
     report_src = None
     schema_src = None
+    is_legacy_layout = False
     for root, dirs, files in os.walk(tmpdir):
         for d in list(dirs):
             if d == "Report" and not d.endswith(".Report"):
                 candidate = os.path.join(root, d)
                 if os.path.isdir(os.path.join(candidate, "definition", "pages")):
                     report_src = candidate
+                    break
+                if os.path.isfile(os.path.join(candidate, "Layout")):
+                    report_src = candidate
+                    is_legacy_layout = True
                     break
         for f in files:
             if f == "DataModelSchema" and schema_src is None:
@@ -378,11 +494,14 @@ def _synthesize_pbip_from_pbit(tmpdir: str, base_name: str) -> None:
             break
 
     if not report_src or not schema_src:
-        return  # Not a .pbit layout we can handle; let the caller error out.
+        return
 
     parent = os.path.dirname(report_src)
     target_report_dir = os.path.join(parent, f"{safe_base}.Report")
     target_model_dir = os.path.join(parent, f"{safe_base}.SemanticModel")
+
+    if is_legacy_layout:
+        _synthesize_pbir_from_legacy_layout(report_src)
 
     if not os.path.exists(target_report_dir):
         os.rename(report_src, target_report_dir)
