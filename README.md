@@ -2,7 +2,7 @@
 
 ## This repository has moved
 
-The Power BI to Databricks AI/BI Dashboard Converter is now maintained in the [`databricks-solutions/technical-services-solutions`](https://github.com/databricks-solutions/technical-services-solutions) repository.
+The Power BI to Databricks AI/BI Dashboard Converter is now maintained in the `databricks-solutions/technical-services-solutions` repository.
 
 **New location:** [https://github.com/databricks-solutions/technical-services-solutions/tree/main/data-warehousing/pbi-aibi-converter](https://github.com/databricks-solutions/technical-services-solutions/tree/main/data-warehousing/pbi-aibi-converter)
 
